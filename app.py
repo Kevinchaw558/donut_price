@@ -13,13 +13,22 @@ CALIBRATION_INTERVAL = 1800
 PRICE_DIVISOR = 100_000
 
 DEFAULT_GRANULARITY = {
-    "minute": 1, "5minutes": 1, "hour": 60,
-    "day": 300, "week": 3600, "month": 86400, "max": 86400
+    "minute": 1,
+    "5minutes": 1,
+    "hour": 60,
+    "day": 300,
+    "week": 3600,
+    "month": 86400,
+    "max": 86400
 }
 
 TIME_RANGES = {
-    "minute": 60, "5minutes": 300, "hour": 3600,
-    "day": 86400, "week": 604800, "month": 2592000
+    "minute": 60,
+    "5minutes": 300,
+    "hour": 3600,
+    "day": 86400,
+    "week": 604800,
+    "month": 2592000
 }
 
 VALID_GRANULARITIES = {1, 10, 60, 300, 3600, 86400}
@@ -39,13 +48,13 @@ HEADERS = {
     )
 }
 
-# C = timestamp + absolute price
-# D = signed price delta
 compressed_data = bytearray()
 calibration_index = []
+
 current_price = None
 current_timestamp = None
 last_calibration = None
+
 data_lock = threading.RLock()
 
 
@@ -60,16 +69,26 @@ def decompress_price(price):
 def write_delta(delta):
     if -64 <= delta <= 63:
         compressed_data.append(delta + 64)
-    else:
+    elif -32768 <= delta <= 32767:
         compressed_data.append(128)
         compressed_data.extend(struct.pack("<h", delta))
+    else:
+        raise ValueError("Price delta is too large")
 
 
 def read_delta(data, pos):
+    if pos >= len(data):
+        raise ValueError("Unexpected end of data")
+
     value = data[pos]
     pos += 1
+
     if value != 128:
         return value - 64, pos
+
+    if pos + 2 > len(data):
+        raise ValueError("Incomplete large delta")
+
     return struct.unpack("<h", data[pos:pos + 2])[0], pos + 2
 
 
@@ -81,8 +100,16 @@ def add_price(timestamp, real_price):
     with data_lock:
         if current_price is None:
             offset = len(compressed_data)
-            compressed_data.extend(struct.pack("<dH", timestamp, price))
-            calibration_index.append((timestamp, offset))
+
+            compressed_data.extend(b"C")
+            compressed_data.extend(
+                struct.pack("<dH", timestamp, price)
+            )
+
+            calibration_index.append(
+                (timestamp, offset)
+            )
+
             last_calibration = timestamp
 
         elif (
@@ -90,8 +117,16 @@ def add_price(timestamp, real_price):
             or timestamp - current_timestamp > SAMPLE_INTERVAL * 1.5
         ):
             offset = len(compressed_data)
-            compressed_data.extend(struct.pack("<dH", timestamp, price))
-            calibration_index.append((timestamp, offset))
+
+            compressed_data.extend(b"C")
+            compressed_data.extend(
+                struct.pack("<dH", timestamp, price)
+            )
+
+            calibration_index.append(
+                (timestamp, offset)
+            )
+
             last_calibration = timestamp
 
         else:
@@ -117,6 +152,7 @@ def decode_history(start_time=None, granularity=1):
                 return
 
             values = [x["price"] for x in bucket]
+
             results.append({
                 "time": bucket[-1]["time"],
                 "price": bucket[-1]["price"],
@@ -124,26 +160,33 @@ def decode_history(start_time=None, granularity=1):
                 "max": max(values),
                 "median": statistics.median(values)
             })
+
             bucket.clear()
 
         while pos < len(compressed_data):
-            kind = compressed_data[pos:pos + 1]
+            record = compressed_data[pos]
             pos += 1
 
-            if kind == b"C":
+            if record == ord("C"):
                 if pos + 10 > len(compressed_data):
                     break
 
                 timestamp, price = struct.unpack(
-                    "<dH", compressed_data[pos:pos + 10]
+                    "<dH",
+                    compressed_data[pos:pos + 10]
                 )
+
                 pos += 10
 
-            elif kind == b"D":
-                if pos + 2 > len(compressed_data):
+            elif record == ord("D"):
+                if timestamp is None or pos + 2 > len(compressed_data):
                     break
 
-                delta, pos = read_delta(compressed_data, pos)
+                delta, pos = read_delta(
+                    compressed_data,
+                    pos
+                )
+
                 price += delta
                 timestamp += SAMPLE_INTERVAL
 
@@ -153,28 +196,39 @@ def decode_history(start_time=None, granularity=1):
             if start_time is not None and timestamp < start_time:
                 continue
 
-            bucket.append({
+            point = {
                 "time": timestamp,
                 "price": decompress_price(price)
-            })
+            }
 
-            if (
-                granularity == 1
-                or timestamp - bucket[0]["time"] >= granularity
-            ):
+            if not bucket:
+                bucket.append(point)
+                continue
+
+            if timestamp - bucket[0]["time"] >= granularity:
                 finish_bucket()
 
+            bucket.append(point)
+
         finish_bucket()
+
         return results
 
 
 def get_elytra_price():
-    response = requests.get(API_URL, headers=HEADERS, timeout=10)
+    response = requests.get(
+        API_URL,
+        headers=HEADERS,
+        timeout=10
+    )
+
     response.raise_for_status()
 
     return next(
-        x["unitPrice"] for x in response.json()
-        if x["itemName"] == "elytra" and not x["isStale"]
+        item["unitPrice"]
+        for item in response.json()
+        if item["itemName"] == "elytra"
+        and not item["isStale"]
     )
 
 
@@ -191,6 +245,7 @@ def collector():
                 f"Elytra: {price:,} | "
                 f"RAM: {size / 1024 / 1024:.2f} MB"
             )
+
         except Exception as e:
             print(f"Error collecting price: {e}")
 
@@ -205,31 +260,52 @@ def home():
 <head>
 <title>Donut Elytra Price</title>
 <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+
 <style>
-body{background:#111;color:white;font-family:Arial,sans-serif;max-width:1000px;
-margin:40px auto;padding:20px}
+body{
+    background:#111;color:white;font-family:Arial,sans-serif;
+    max-width:1000px;margin:40px auto;padding:20px
+}
 h1{text-align:center}
 #price{text-align:center;font-size:40px;font-weight:bold;margin:20px}
-.controls{display:flex;flex-wrap:wrap;gap:20px;justify-content:center;margin:20px 0}
+.controls{
+    display:flex;flex-wrap:wrap;gap:20px;
+    justify-content:center;margin:20px 0
+}
 .control{text-align:center}
-.control label{display:block;margin-bottom:8px;color:#aaa;font-size:14px}
-.buttons{display:flex;gap:5px;flex-wrap:wrap;justify-content:center}
-button{background:#222;color:white;border:1px solid #444;border-radius:7px;
-padding:8px 12px;cursor:pointer}
+.control label{
+    display:block;margin-bottom:8px;color:#aaa;font-size:14px
+}
+.buttons{
+    display:flex;gap:5px;flex-wrap:wrap;justify-content:center
+}
+button{
+    background:#222;color:white;border:1px solid #444;
+    border-radius:7px;padding:8px 12px;cursor:pointer
+}
 button:hover{background:#333}
-button.active{background:#00a866;border-color:#00ff88}
-#stats{background:#181818;border-radius:10px;padding:12px 16px;margin-bottom:15px;
-display:flex;justify-content:center;flex-wrap:wrap;gap:25px;color:#ccc}
+button.active{
+    background:#00a866;border-color:#00ff88
+}
+#stats{
+    background:#181818;border-radius:10px;padding:12px 16px;
+    margin-bottom:15px;display:flex;justify-content:center;
+    flex-wrap:wrap;gap:25px;color:#ccc
+}
 .stat strong{color:white}
-canvas{background:#181818;border-radius:12px;padding:10px}
+canvas{
+    background:#181818;border-radius:12px;padding:10px
+}
 </style>
 </head>
 
 <body>
+
 <h1>Donut SMP Elytra Price</h1>
 <div id="price">Loading...</div>
 
 <div class="controls">
+
 <div class="control">
 <label>Time Range</label>
 <div class="buttons" id="rangeButtons">
@@ -265,6 +341,7 @@ canvas{background:#181818;border-radius:12px;padding:10px}
 <button data-smoothness="4">Very High</button>
 </div>
 </div>
+
 </div>
 
 <div id="stats">
@@ -281,8 +358,13 @@ canvas{background:#181818;border-radius:12px;padding:10px}
 const ctx=document.getElementById("chart");
 
 const defaultGranularity={
-    minute:1,"5minutes":1,hour:60,day:300,
-    week:3600,month:86400,max:86400
+    minute:1,
+    "5minutes":1,
+    hour:60,
+    day:300,
+    week:3600,
+    month:86400,
+    max:86400
 };
 
 let selectedRange="hour";
@@ -290,24 +372,30 @@ let selectedGranularity=defaultGranularity[selectedRange];
 let selectedSmoothness=0;
 let chartHistory=[];
 
+
 function smoothData(data,level){
-    if(!level||data.length<3)return data.map(x=>x.price);
+    if(level===0||data.length<3)
+        return data.map(x=>x.price);
 
     const radius=level*3;
 
     return data.map((point,i)=>{
-        let start=Math.max(0,i-radius);
-        let end=Math.min(data.length-1,i+radius);
+        const start=Math.max(0,i-radius);
+        const end=Math.min(data.length-1,i+radius);
+
         let total=0;
 
-        for(let j=start;j<=end;j++) total+=data[j].price;
+        for(let j=start;j<=end;j++)
+            total+=data[j].price;
 
         return total/(end-start+1);
     });
 }
 
+
 const chart=new Chart(ctx,{
     type:"line",
+
     data:{
         labels:[],
         datasets:[{
@@ -321,35 +409,79 @@ const chart=new Chart(ctx,{
             fill:true
         }]
     },
+
     options:{
         responsive:true,
         animation:false,
-        interaction:{mode:"index",intersect:false},
-        plugins:{tooltip:{enabled:false}},
+
+        interaction:{
+            mode:"index",
+            intersect:false
+        },
+
+        plugins:{
+            tooltip:{enabled:false}
+        },
+
         scales:{
-            x:{title:{display:true,text:"Time"}},
+            x:{
+                title:{
+                    display:true,
+                    text:"Time"
+                }
+            },
+
             y:{
-                title:{display:true,text:"Price"},
-                ticks:{callback:value=>Number(value).toLocaleString()}
+                title:{
+                    display:true,
+                    text:"Price"
+                },
+
+                ticks:{
+                    callback:value=>
+                        Number(value).toLocaleString()
+                }
             }
         }
     }
 });
 
+
 function updateButtons(){
-    document.querySelectorAll("#rangeButtons button").forEach(b=>
-        b.classList.toggle("active",b.dataset.range===selectedRange));
 
-    document.querySelectorAll("#granularityButtons button").forEach(b=>
-        b.classList.toggle("active",
-            Number(b.dataset.granularity)===selectedGranularity));
+    document
+        .querySelectorAll("#rangeButtons button")
+        .forEach(button=>{
+            button.classList.toggle(
+                "active",
+                button.dataset.range===selectedRange
+            );
+        });
 
-    document.querySelectorAll("#smoothnessButtons button").forEach(b=>
-        b.classList.toggle("active",
-            Number(b.dataset.smoothness)===selectedSmoothness));
+    document
+        .querySelectorAll("#granularityButtons button")
+        .forEach(button=>{
+            button.classList.toggle(
+                "active",
+                Number(button.dataset.granularity)
+                ===selectedGranularity
+            );
+        });
+
+    document
+        .querySelectorAll("#smoothnessButtons button")
+        .forEach(button=>{
+            button.classList.toggle(
+                "active",
+                Number(button.dataset.smoothness)
+                ===selectedSmoothness
+            );
+        });
 }
 
+
 function showStats(point){
+
     if(!point)return;
 
     document.getElementById("hoverTime").textContent=
@@ -368,20 +500,32 @@ function showStats(point){
         Math.round(point.median).toLocaleString();
 }
 
+
 ctx.addEventListener("mousemove",event=>{
+
     const elements=chart.getElementsAtEventForMode(
-        event,"index",{intersect:false},false
+        event,
+        "index",
+        {intersect:false},
+        false
     );
 
-    if(elements.length)showStats(chartHistory[elements[0].index]);
+    if(elements.length)
+        showStats(chartHistory[elements[0].index]);
 });
 
+
 async function update(){
+
     try{
+
         const response=await fetch(
             "/history?range="+selectedRange+
             "&granularity="+selectedGranularity
         );
+
+        if(!response.ok)
+            throw new Error("HTTP "+response.status);
 
         chartHistory=await response.json();
 
@@ -390,56 +534,88 @@ async function update(){
         );
 
         chart.data.datasets[0].data=smoothData(
-            chartHistory,selectedSmoothness
+            chartHistory,
+            selectedSmoothness
         );
 
         chart.update();
 
         if(chartHistory.length){
+
+            const latest=
+                chartHistory[chartHistory.length-1].price;
+
             document.getElementById("price").textContent=
-                Math.round(
-                    chartHistory[chartHistory.length-1].price
-                ).toLocaleString()+" coins";
+                Math.round(latest).toLocaleString()
+                +" coins";
         }
+
     }catch(error){
-        console.error("History update failed:",error);
+
+        console.error(
+            "History update failed:",
+            error
+        );
     }
 }
 
-document.querySelectorAll("#rangeButtons button").forEach(b=>
-    b.addEventListener("click",()=>{
-        selectedRange=b.dataset.range;
-        selectedGranularity=defaultGranularity[selectedRange];
-        updateButtons();
-        update();
-    })
-);
 
-document.querySelectorAll("#granularityButtons button").forEach(b=>
-    b.addEventListener("click",()=>{
-        selectedGranularity=Number(b.dataset.granularity);
-        updateButtons();
-        update();
-    })
-);
+document
+    .querySelectorAll("#rangeButtons button")
+    .forEach(button=>{
+        button.addEventListener("click",()=>{
 
-document.querySelectorAll("#smoothnessButtons button").forEach(b=>
-    b.addEventListener("click",()=>{
-        selectedSmoothness=Number(b.dataset.smoothness);
+            selectedRange=button.dataset.range;
 
-        chart.data.datasets[0].data=smoothData(
-            chartHistory,selectedSmoothness
-        );
+            selectedGranularity=
+                defaultGranularity[selectedRange];
 
-        chart.update();
-        updateButtons();
-    })
-);
+            updateButtons();
+            update();
+        });
+    });
+
+
+document
+    .querySelectorAll("#granularityButtons button")
+    .forEach(button=>{
+        button.addEventListener("click",()=>{
+
+            selectedGranularity=
+                Number(button.dataset.granularity);
+
+            updateButtons();
+            update();
+        });
+    });
+
+
+document
+    .querySelectorAll("#smoothnessButtons button")
+    .forEach(button=>{
+        button.addEventListener("click",()=>{
+
+            selectedSmoothness=
+                Number(button.dataset.smoothness);
+
+            chart.data.datasets[0].data=
+                smoothData(
+                    chartHistory,
+                    selectedSmoothness
+                );
+
+            chart.update();
+            updateButtons();
+        });
+    });
+
 
 updateButtons();
 update();
+
 setInterval(update,5000);
 </script>
+
 </body>
 </html>
 """)
@@ -457,11 +633,17 @@ def history_endpoint():
     if granularity not in VALID_GRANULARITIES:
         granularity=DEFAULT_GRANULARITY[selected_range]
 
-    start_time=None if selected_range=="max" else (
-        time.time()-TIME_RANGES[selected_range]
-    )
+    if selected_range=="max":
+        start_time=None
+    else:
+        start_time=time.time()-TIME_RANGES[selected_range]
 
-    return jsonify(decode_history(start_time,granularity))
+    return jsonify(
+        decode_history(
+            start_time,
+            granularity
+        )
+    )
 
 
 @app.route("/stats")
@@ -470,18 +652,27 @@ def stats():
         return jsonify({
             "compressed_bytes":len(compressed_data),
             "compressed_mb":round(
-                len(compressed_data)/1024/1024,3
+                len(compressed_data)/1024/1024,
+                3
             ),
             "calibrations":len(calibration_index),
             "price_scale":PRICE_DIVISOR,
             "calibration_seconds":CALIBRATION_INTERVAL,
             "current_price":(
-                None if current_price is None
+                None
+                if current_price is None
                 else decompress_price(current_price)
             )
         })
 
 
 if __name__=="__main__":
-    threading.Thread(target=collector,daemon=True).start()
-    app.run(host="0.0.0.0",port=10000)
+    threading.Thread(
+        target=collector,
+        daemon=True
+    ).start()
+
+    app.run(
+        host="0.0.0.0",
+        port=10000
+    )
