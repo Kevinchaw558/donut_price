@@ -8,7 +8,25 @@ API_URL = "https://api.donut.auction/v2/tickers/"
 @app.route("/")
 def home():
     try:
-        response = requests.get(API_URL, timeout=10)
+        response = requests.get(
+            API_URL,
+            headers={
+                "Accept": "*/*",
+                "Accept-Language": "en-US,en;q=0.9",
+                "Cache-Control": "no-cache",
+                "Content-Type": "application/json",
+                "Origin": "https://donut.auction",
+                "Pragma": "no-cache",
+                "Referer": "https://donut.auction/",
+                "User-Agent": (
+                    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/152.0.0.0 Safari/537.36"
+                ),
+            },
+            timeout=10,
+        )
+
         response.raise_for_status()
 
         tickers = response.json()
