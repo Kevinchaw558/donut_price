@@ -7,6 +7,11 @@ import statistics
 
 app = Flask(__name__)
 
+@app.errorhandler(Exception)
+def handle_error(error):
+    app.logger.exception("Unhandled error")
+    return jsonify({"error": str(error)}), 500
+
 API_URL = "https://api.donut.auction/v2/tickers/"
 SAMPLE_INTERVAL = 1
 CALIBRATION_INTERVAL = 1800
@@ -67,6 +72,7 @@ def decompress_price(price):
 
 
 def write_delta(delta):
+    compressed_data.append(ord("D"))
     if -64 <= delta <= 63:
         compressed_data.append(delta + 64)
     elif -32768 <= delta <= 32767:
