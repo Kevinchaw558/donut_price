@@ -1,9 +1,8 @@
-from flask import Flask, jsonify, render_template_string
+from flask import Flask, jsonify, render_template_string, request
 import requests
 import threading
 import time
 import struct
-from collections import deque
 
 app = Flask(__name__)
 
@@ -13,19 +12,29 @@ API_URL = "https://api.donut.auction/v2/tickers/"
 # SETTINGS
 # ============================================================
 
-SAMPLE_INTERVAL = 1          # 1 price check per second
-CALIBRATION_INTERVAL = 1800  # 30 minutes
-MAX_AGE = 60 * 60 * 24 * 30 * 6  # ~6 months
-
-# We only keep the first 4 meaningful digits.
-#
-# Example:
-#
-# 343,512,847 -> 3435 -> 343,500,000
-# 343,587,291 -> 3435 -> 343,500,000
-# 343,600,000 -> 3436 -> 343,600,000
-#
+SAMPLE_INTERVAL = 1
+CALIBRATION_INTERVAL = 30 * 60
 PRICE_DIVISOR = 100_000
+
+# Default granularity for each time range.
+DEFAULT_GRANULARITY = {
+    "minute": 1,
+    "5minutes": 1,
+    "hour": 60,
+    "day": 300,
+    "week": 3600,
+    "month": 86400,
+    "max": 86400,
+}
+
+TIME_RANGES = {
+    "minute": 60,
+    "5minutes": 5 * 60,
+    "hour": 60 * 60,
+    "day": 24 * 60 * 60,
+    "week": 7 * 24 * 60 * 60,
+    "month": 30 * 24 * 60 * 60,
+}
 
 
 # ============================================================
@@ -49,352 +58,206 @@ HEADERS = {
 
 
 # ============================================================
-# COMPRESSED STORAGE
+# COMPRESSED RAM STORAGE
 # ============================================================
 
-"""
-We store the data in 30-minute blocks.
-
-Each block looks like:
-
-    [8-byte timestamp]
-    [2-byte absolute price]
-
-    [price delta]
-    [price delta]
-    [price delta]
-    ...
-    1800 samples
-
-Then another:
-
-    [8-byte timestamp]
-    [2-byte absolute price]
-
-    [price delta]
-    ...
-
-The timestamp is only written once every 30 minutes.
-
-The price is stored as:
-
-    actual_price // 100000
-
-So ~343 million becomes ~3435.
-
-Normal deltas are stored in ONE BYTE.
-
-To allow larger deltas, 0x80 is used as an escape:
-
-    0x00 - 0x7F:
-        signed delta from -64 to +63
-
-    0x80:
-        next 2 bytes contain signed 16-bit delta
-
-This means normal price movement costs only ONE BYTE.
-"""
-
-
-# All compressed data lives here.
-compressed_data = bytearray()
-
-# Calibration positions in compressed_data.
+# C = calibration:
 #
-# Each entry:
+#     C + 8 byte timestamp + 2 byte price
 #
-#     (timestamp, byte_position)
+# D = normal delta:
 #
-calibration_index = []
+#     D + 2 byte signed price delta
+#
+# Every 30 minutes we store a calibration.
+# A calibration is also stored if we detect a time gap.
+#
+# The actual recording ALWAYS happens at full resolution.
 
-# Current state
-current_price = None
-current_timestamp = None
+history = bytearray()
 
-# Number of samples since the latest calibration
-samples_since_calibration = 0
+last_price = None
+last_timestamp = None
+last_calibration = None
 
-# Protects the bytearray and state from simultaneous
-# collector/web requests.
-data_lock = threading.RLock()
+data_lock = threading.Lock()
 
 
 # ============================================================
-# PRICE CONVERSION
+# PRICE COMPRESSION
 # ============================================================
 
 def compress_price(price):
-    """
-    Convert real price into our 4-digit representation.
-
-    Example:
-        343,512,847 -> 3435
-    """
-
-    return int(price) // PRICE_DIVISOR
+    return round(price / PRICE_DIVISOR)
 
 
 def decompress_price(price):
-    """
-    Convert compressed price back into display price.
-
-    Example:
-        3435 -> 343,500,000
-    """
-
     return price * PRICE_DIVISOR
 
 
 # ============================================================
-# DELTA ENCODING
+# STORE PRICE
 # ============================================================
 
-def write_delta(delta):
-    """
-    Store a signed price delta.
-
-    If the delta fits inside -64..63:
-        one byte
-
-    Otherwise:
-        0x80 + signed 16-bit integer
-    """
-
-    # Normal one-byte delta.
-    if -64 <= delta <= 63:
-
-        # Convert signed range:
-        #
-        # -64 -> 0
-        #   0 -> 64
-        # +63 -> 127
-        #
-        encoded = delta + 64
-
-        compressed_data.append(encoded)
-
-    else:
-
-        # Escape marker.
-        compressed_data.append(0x80)
-
-        # Signed 16-bit delta.
-        compressed_data.extend(
-            struct.pack("<h", delta)
-        )
-
-
-def read_delta(data, position):
-    """
-    Read one price delta.
-
-    Returns:
-        (delta, new_position)
-    """
-
-    value = data[position]
-    position += 1
-
-    # Normal delta.
-    if value != 0x80:
-
-        return value - 64, position
-
-    # Large delta.
-    delta = struct.unpack(
-        "<h",
-        data[position:position + 2]
-    )[0]
-
-    position += 2
-
-    return delta, position
-
-
-# ============================================================
-# ADD PRICE
-# ============================================================
-
-def add_price(timestamp, real_price):
-
-    global current_price
-    global current_timestamp
-    global samples_since_calibration
+def store_price(timestamp, real_price):
+    global last_price
+    global last_timestamp
+    global last_calibration
 
     price = compress_price(real_price)
 
     with data_lock:
 
-        # ----------------------------------------------------
-        # FIRST SAMPLE
-        # ----------------------------------------------------
-
-        if current_price is None:
-
-            # Store absolute timestamp.
-            compressed_data.extend(
-                struct.pack(
-                    "<d",
-                    timestamp
-                )
+        # First sample.
+        if last_price is None:
+            history.extend(b"C")
+            history.extend(
+                struct.pack("<dH", timestamp, price)
             )
 
-            # Store absolute price.
-            compressed_data.extend(
-                struct.pack(
-                    "<H",
-                    price
-                )
-            )
-
-            calibration_index.append(
-                (
-                    timestamp,
-                    0
-                )
-            )
-
-            current_price = price
-            current_timestamp = timestamp
-            samples_since_calibration = 0
+            last_price = price
+            last_timestamp = timestamp
+            last_calibration = timestamp
 
             return
 
-        # ----------------------------------------------------
-        # CALIBRATION
-        # ----------------------------------------------------
+        time_gap = timestamp - last_timestamp
 
-        if samples_since_calibration >= CALIBRATION_INTERVAL:
-
-            offset = len(compressed_data)
-
-            # Absolute timestamp.
-            compressed_data.extend(
-                struct.pack(
-                    "<d",
-                    timestamp
-                )
+        # Recalibrate every 30 minutes or after a gap.
+        if (
+            timestamp - last_calibration >= CALIBRATION_INTERVAL
+            or time_gap > SAMPLE_INTERVAL * 1.5
+        ):
+            history.extend(b"C")
+            history.extend(
+                struct.pack("<dH", timestamp, price)
             )
 
-            # Absolute price.
-            compressed_data.extend(
-                struct.pack(
-                    "<H",
-                    price
-                )
+            last_calibration = timestamp
+
+        else:
+            delta = price - last_price
+
+            history.extend(b"D")
+            history.extend(
+                struct.pack("<h", delta)
             )
 
-            calibration_index.append(
-                (
-                    timestamp,
-                    offset
-                )
-            )
-
-            current_price = price
-            current_timestamp = timestamp
-            samples_since_calibration = 0
-
-            return
-
-        # ----------------------------------------------------
-        # NORMAL DELTA
-        # ----------------------------------------------------
-
-        delta = price - current_price
-
-        write_delta(delta)
-
-        current_price = price
-        current_timestamp = timestamp
-
-        samples_since_calibration += 1
+        last_price = price
+        last_timestamp = timestamp
 
 
 # ============================================================
 # DECODE HISTORY
 # ============================================================
 
-def decode_history():
+def decode_history(start_time=None, granularity=1):
+    """
+    Decode the compressed history.
+
+    The recording remains at 1-second resolution, but only
+    every `granularity` seconds is returned to the browser.
+
+    Example:
+        granularity=1     -> every second
+        granularity=10    -> every 10 seconds
+        granularity=60    -> every minute
+        granularity=300   -> every 5 minutes
+        granularity=3600  -> every hour
+        granularity=86400 -> every day
+    """
 
     with data_lock:
 
-        if not compressed_data:
+        if not history:
             return []
+
+        position = 0
+        timestamp = None
+        price = None
 
         results = []
 
-        position = 0
+        # Used so we only send points at the requested interval.
+        last_sent_timestamp = None
 
-        current_timestamp = None
-        current_price = None
+        while position < len(history):
 
-        first_block = True
-
-        while position < len(compressed_data):
-
-            # ------------------------------------------------
-            # CALIBRATION / BLOCK START
-            # ------------------------------------------------
-
-            if position + 10 > len(compressed_data):
-                break
-
-            current_timestamp = struct.unpack(
-                "<d",
-                compressed_data[
-                    position:position + 8
-                ]
-            )[0]
-
-            position += 8
-
-            current_price = struct.unpack(
-                "<H",
-                compressed_data[
-                    position:position + 2
-                ]
-            )[0]
-
-            position += 2
-
-            # Add calibration point.
-            results.append({
-                "time": current_timestamp,
-                "price": decompress_price(
-                    current_price
-                )
-            })
+            record_type = history[position:position + 1]
+            position += 1
 
             # ------------------------------------------------
-            # READ DELTAS
+            # CALIBRATION
             # ------------------------------------------------
 
-            for _ in range(CALIBRATION_INTERVAL):
+            if record_type == b"C":
 
-                if position >= len(compressed_data):
+                if position + 10 > len(history):
                     break
 
-                delta, position = read_delta(
-                    compressed_data,
-                    position
+                timestamp, price = struct.unpack(
+                    "<dH",
+                    history[position:position + 10]
                 )
 
-                current_price += delta
-                current_timestamp += SAMPLE_INTERVAL
+                position += 10
 
-                results.append({
-                    "time": current_timestamp,
-                    "price": decompress_price(
-                        current_price
-                    )
-                })
+                # A calibration is an exact known point.
+                if (
+                    start_time is None
+                    or timestamp >= start_time
+                ):
+                    results.append({
+                        "time": timestamp,
+                        "price": decompress_price(price)
+                    })
+
+                    last_sent_timestamp = timestamp
+
+            # ------------------------------------------------
+            # NORMAL DELTA
+            # ------------------------------------------------
+
+            elif record_type == b"D":
+
+                if position + 2 > len(history):
+                    break
+
+                delta = struct.unpack(
+                    "<h",
+                    history[position:position + 2]
+                )[0]
+
+                position += 2
+
+                price += delta
+                timestamp += SAMPLE_INTERVAL
+
+                # Don't bother creating points before the
+                # requested range.
+                if start_time is not None and timestamp < start_time:
+                    continue
+
+                # Send only the requested granularity.
+                if (
+                    last_sent_timestamp is None
+                    or timestamp - last_sent_timestamp >= granularity
+                ):
+                    results.append({
+                        "time": timestamp,
+                        "price": decompress_price(price)
+                    })
+
+                    last_sent_timestamp = timestamp
+
+            else:
+                break
 
         return results
 
 
 # ============================================================
-# API REQUEST
+# GET ELYTRA PRICE
 # ============================================================
 
 def get_elytra_price():
@@ -430,16 +293,15 @@ def collector():
         try:
 
             price = get_elytra_price()
-
             timestamp = time.time()
 
-            add_price(
+            store_price(
                 timestamp,
                 price
             )
 
             with data_lock:
-                size = len(compressed_data)
+                size = len(history)
 
             print(
                 f"Elytra: {price:,} "
@@ -447,14 +309,11 @@ def collector():
             )
 
         except Exception as e:
-
             print(
                 f"Error collecting price: {e}"
             )
 
-        time.sleep(
-            SAMPLE_INTERVAL
-        )
+        time.sleep(SAMPLE_INTERVAL)
 
 
 # ============================================================
@@ -496,6 +355,50 @@ def home():
             margin: 20px;
         }
 
+        .controls {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 20px;
+            justify-content: center;
+            margin: 20px 0 30px;
+        }
+
+        .control {
+            text-align: center;
+        }
+
+        .control label {
+            display: block;
+            margin-bottom: 8px;
+            color: #aaa;
+            font-size: 14px;
+        }
+
+        .buttons {
+            display: flex;
+            gap: 5px;
+            flex-wrap: wrap;
+            justify-content: center;
+        }
+
+        button {
+            background: #222;
+            color: white;
+            border: 1px solid #444;
+            border-radius: 7px;
+            padding: 8px 12px;
+            cursor: pointer;
+        }
+
+        button:hover {
+            background: #333;
+        }
+
+        button.active {
+            background: #00a866;
+            border-color: #00ff88;
+        }
+
         canvas {
             background: #181818;
             border-radius: 12px;
@@ -512,12 +415,114 @@ def home():
 
 <div id="price">Loading...</div>
 
+<div class="controls">
+
+    <div class="control">
+
+        <label>Time Range</label>
+
+        <div class="buttons" id="rangeButtons">
+
+            <button data-range="minute">1 min</button>
+            <button data-range="5minutes">5 min</button>
+            <button data-range="hour">1 hour</button>
+            <button data-range="day">1 day</button>
+            <button data-range="week">1 week</button>
+            <button data-range="month">1 month</button>
+            <button data-range="max">Max</button>
+
+        </div>
+
+    </div>
+
+
+    <div class="control">
+
+        <label>Granularity</label>
+
+        <div class="buttons" id="granularityButtons">
+
+            <button data-granularity="1">1 sec</button>
+            <button data-granularity="10">10 sec</button>
+            <button data-granularity="60">1 min</button>
+            <button data-granularity="300">5 min</button>
+            <button data-granularity="3600">1 hour</button>
+            <button data-granularity="86400">1 day</button>
+
+        </div>
+
+    </div>
+
+
+    <div class="control">
+
+        <label>Tension</label>
+
+        <div class="buttons" id="tensionButtons">
+
+            <button data-tension="0">0</button>
+            <button data-tension="0.2">0.2</button>
+            <button data-tension="0.4">0.4</button>
+            <button data-tension="0.6">0.6</button>
+            <button data-tension="0.8">0.8</button>
+            <button data-tension="1">1</button>
+
+        </div>
+
+    </div>
+
+</div>
+
+
 <canvas id="chart"></canvas>
+
 
 <script>
 
 const ctx =
     document.getElementById("chart");
+
+
+// ----------------------------------------------------------
+// SETTINGS
+// ----------------------------------------------------------
+
+const defaultGranularity = {
+
+    minute: 1,
+    "5minutes": 1,
+    hour: 60,
+    day: 300,
+    week: 3600,
+    month: 86400,
+    max: 86400
+
+};
+
+
+const rangeSeconds = {
+
+    minute: 60,
+    "5minutes": 300,
+    hour: 3600,
+    day: 86400,
+    week: 604800,
+    month: 2592000
+
+};
+
+
+let selectedRange = "hour";
+
+let selectedGranularity =
+    defaultGranularity[selectedRange];
+
+let selectedTension = 0.4;
+
+
+// ----------------------------------------------------------
+// CHART
+// ----------------------------------------------------------
 
 const chart = new Chart(ctx, {
 
@@ -540,7 +545,7 @@ const chart = new Chart(ctx, {
 
             borderWidth: 2,
 
-            tension: 0.2,
+            tension: selectedTension,
 
             pointRadius: 0,
 
@@ -553,6 +558,8 @@ const chart = new Chart(ctx, {
     options: {
 
         responsive: true,
+
+        animation: false,
 
         scales: {
 
@@ -581,27 +588,88 @@ const chart = new Chart(ctx, {
 });
 
 
+// ----------------------------------------------------------
+// BUTTON STATE
+// ----------------------------------------------------------
+
+function updateButtons() {
+
+    document
+        .querySelectorAll("#rangeButtons button")
+        .forEach(button => {
+
+            button.classList.toggle(
+                "active",
+                button.dataset.range === selectedRange
+            );
+
+        });
+
+
+    document
+        .querySelectorAll("#granularityButtons button")
+        .forEach(button => {
+
+            button.classList.toggle(
+                "active",
+                Number(button.dataset.granularity)
+                === selectedGranularity
+            );
+
+        });
+
+
+    document
+        .querySelectorAll("#tensionButtons button")
+        .forEach(button => {
+
+            button.classList.toggle(
+                "active",
+                Number(button.dataset.tension)
+                === selectedTension
+            );
+
+        });
+
+}
+
+
+// ----------------------------------------------------------
+// GET HISTORY
+// ----------------------------------------------------------
+
 async function update() {
 
     try {
 
+        let url =
+            "/history?range="
+            + selectedRange
+            + "&granularity="
+            + selectedGranularity;
+
+
         const response =
-            await fetch("/history");
+            await fetch(url);
 
         const data =
             await response.json();
+
 
         chart.data.labels =
             data.map(x =>
                 new Date(
                     x.time * 1000
-                ).toLocaleTimeString()
+                ).toLocaleString()
             );
+
 
         chart.data.datasets[0].data =
             data.map(x => x.price);
 
+
         chart.update();
+
 
         if (data.length > 0) {
 
@@ -628,9 +696,104 @@ async function update() {
 }
 
 
+// ----------------------------------------------------------
+// RANGE BUTTONS
+// ----------------------------------------------------------
+
+document
+    .querySelectorAll("#rangeButtons button")
+    .forEach(button => {
+
+        button.addEventListener(
+            "click",
+            () => {
+
+                selectedRange =
+                    button.dataset.range;
+
+                // Automatically choose the sensible
+                // granularity for this range.
+                selectedGranularity =
+                    defaultGranularity[
+                        selectedRange
+                    ];
+
+                updateButtons();
+                update();
+
+            }
+        );
+
+    });
+
+
+// ----------------------------------------------------------
+// GRANULARITY BUTTONS
+// ----------------------------------------------------------
+
+document
+    .querySelectorAll("#granularityButtons button")
+    .forEach(button => {
+
+        button.addEventListener(
+            "click",
+            () => {
+
+                selectedGranularity =
+                    Number(
+                        button.dataset.granularity
+                    );
+
+                updateButtons();
+                update();
+
+            }
+        );
+
+    });
+
+
+// ----------------------------------------------------------
+// TENSION BUTTONS
+// ----------------------------------------------------------
+
+document
+    .querySelectorAll("#tensionButtons button")
+    .forEach(button => {
+
+        button.addEventListener(
+            "click",
+            () => {
+
+                selectedTension =
+                    Number(
+                        button.dataset.tension
+                    );
+
+                chart.data.datasets[0].tension =
+                    selectedTension;
+
+                chart.update();
+
+                updateButtons();
+
+            }
+        );
+
+    });
+
+
+// ----------------------------------------------------------
+// INITIAL LOAD
+// ----------------------------------------------------------
+
+updateButtons();
+
 update();
 
-setInterval(update, 2000);
+
+// Refresh the current graph every 5 seconds.
+setInterval(update, 5000);
 
 </script>
 
@@ -645,10 +808,56 @@ setInterval(update, 2000);
 # ============================================================
 
 @app.route("/history")
-def history():
+def history_endpoint():
+
+    selected_range = request.args.get(
+        "range",
+        "hour"
+    )
+
+    selected_granularity = request.args.get(
+        "granularity",
+        type=int
+    )
+
+    # Unknown range → hour.
+    if selected_range not in DEFAULT_GRANULARITY:
+        selected_range = "hour"
+
+    # If the browser didn't specify granularity,
+    # use the sensible default.
+    if selected_granularity is None:
+        selected_granularity = DEFAULT_GRANULARITY[
+            selected_range
+        ]
+
+    # Prevent invalid values.
+    if selected_granularity not in {
+        1,
+        10,
+        60,
+        300,
+        3600,
+        86400
+    }:
+        selected_granularity = DEFAULT_GRANULARITY[
+            selected_range
+        ]
+
+    # Determine the beginning of the requested range.
+    if selected_range == "max":
+        start_time = None
+    else:
+        start_time = (
+            time.time()
+            - TIME_RANGES[selected_range]
+        )
 
     return jsonify(
-        decode_history()
+        decode_history(
+            start_time=start_time,
+            granularity=selected_granularity
+        )
     )
 
 
@@ -664,40 +873,36 @@ def stats():
         return jsonify({
 
             "compressed_bytes":
-                len(compressed_data),
+                len(history),
 
             "compressed_mb":
                 round(
-                    len(compressed_data)
+                    len(history)
                     / 1024
                     / 1024,
                     3
                 ),
 
-            "calibrations":
-                len(calibration_index),
-
-            "price_scale":
-                PRICE_DIVISOR,
-
-            "calibration_seconds":
-                CALIBRATION_INTERVAL,
-
             "current_price":
                 (
                     None
-                    if current_price is None
-                    else
-                    decompress_price(
-                        current_price
+                    if last_price is None
+                    else decompress_price(
+                        last_price
                     )
-                )
+                ),
+
+            "calibration_interval":
+                CALIBRATION_INTERVAL,
+
+            "price_divisor":
+                PRICE_DIVISOR
 
         })
 
 
 # ============================================================
-# START SERVER
+# START
 # ============================================================
 
 if __name__ == "__main__":
