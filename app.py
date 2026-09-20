@@ -1,8 +1,9 @@
+import os
 from flask import Flask, render_template_string
 
 app = Flask(__name__)
 
-# Inline HTML/CSS template to keep it in a single file
+# Inline HTML/CSS template to keep it all in a single file
 HTML_TEMPLATE = """
 <!DOCTYPE html>
 <html lang="en">
@@ -31,6 +32,7 @@ HTML_TEMPLATE = """
             /* Spin animation lasts 2 seconds, moves linearly, and loops infinitely */
             animation: spin 2s linear infinite;
             user-select: none;
+            display: inline-block;
         }
 
         @keyframes spin {
@@ -55,8 +57,16 @@ HTML_TEMPLATE = """
 def home():
     return render_template_string(HTML_TEMPLATE)
 
+# Prevents Flask from throwing annoying 404 routing errors in your Render logs
+@app.route('/favicon.ico')
+def favicon():
+    return '', 204
+
 if __name__ == '__main__':
-    app.run(debug=True)
+    # Binds to 0.0.0.0 and grabs Render's dynamic PORT environment variable
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host='0.0.0.0', port=port, debug=True)
+
 # from flask import Flask, jsonify, render_template_string, request
 # import requests
 # import threading
