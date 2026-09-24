@@ -29,7 +29,9 @@ b2_api.authorize_account(
     B2_APPLICATION_KEY
 )
 
-b2_bucket = b2_api.get_bucket_by_name(B2_BUCKET_NAME)
+b2_bucket = b2_api.get_bucket_by_name(
+    B2_BUCKET_NAME
+)
 
 B2_HISTORY_FILENAME = "price_history.bin"
 B2_UPLOAD_INTERVAL = 1800  # 30 minutes
@@ -115,7 +117,6 @@ HEADERS = {
 # Calibration records reset the timestamp and price.
 # This makes the stream resilient to missed samples.
 
-
 compressed_data = bytearray()
 
 # (timestamp, byte_offset)
@@ -162,6 +163,7 @@ def read_delta(data, pos):
     shift = 0
 
     while True:
+
         if pos >= len(data):
             raise ValueError("Incomplete delta")
 
@@ -176,7 +178,9 @@ def read_delta(data, pos):
         shift += 7
 
         if shift > 63:
-            raise ValueError("Invalid/corrupt delta")
+            raise ValueError(
+                "Invalid/corrupt delta"
+            )
 
     delta = (value >> 1) ^ -(value & 1)
 
@@ -188,6 +192,7 @@ def read_delta(data, pos):
 # ============================================================
 
 def write_calibration(timestamp, price):
+
     offset = len(compressed_data)
 
     compressed_data.extend(b"C")
@@ -210,6 +215,7 @@ def write_calibration(timestamp, price):
 # ============================================================
 
 def add_price(timestamp, real_price):
+
     global current_price
     global current_timestamp
     global last_calibration
@@ -217,7 +223,9 @@ def add_price(timestamp, real_price):
     price = compress_price(real_price)
 
     if price < 0:
-        raise ValueError("Price cannot be negative")
+        raise ValueError(
+            "Price cannot be negative"
+        )
 
     with data_lock:
 
@@ -231,9 +239,13 @@ def add_price(timestamp, real_price):
             last_calibration = timestamp
 
         elif (
-            timestamp - last_calibration >= CALIBRATION_INTERVAL
+            timestamp - last_calibration
+            >= CALIBRATION_INTERVAL
+
             or
-            timestamp - current_timestamp > SAMPLE_INTERVAL * 1.5
+
+            timestamp - current_timestamp
+            > SAMPLE_INTERVAL * 1.5
         ):
 
             write_calibration(
@@ -258,16 +270,6 @@ def add_price(timestamp, real_price):
 # ============================================================
 
 def rebuild_state_from_history():
-    """
-    Scan the restored binary history and rebuild:
-
-    - calibration_index
-    - current_price
-    - current_timestamp
-    - last_calibration
-
-    This is only done once when the application starts.
-    """
 
     global current_price
     global current_timestamp
@@ -276,6 +278,7 @@ def rebuild_state_from_history():
     calibration_index.clear()
 
     if not compressed_data:
+
         current_price = None
         current_timestamp = None
         last_calibration = None
@@ -288,6 +291,7 @@ def rebuild_state_from_history():
 
     timestamp = None
     price = None
+
     latest_calibration = None
 
     records = 0
@@ -308,13 +312,18 @@ def rebuild_state_from_history():
 
             timestamp, price = struct.unpack(
                 "<dQ",
-                compressed_data[pos:pos + 16]
+                compressed_data[
+                    pos:pos + 16
+                ]
             )
 
             pos += 16
 
             calibration_index.append(
-                (timestamp, record_offset)
+                (
+                    timestamp,
+                    record_offset
+                )
             )
 
             latest_calibration = timestamp
@@ -323,7 +332,10 @@ def rebuild_state_from_history():
 
         elif record == ord("D"):
 
-            if timestamp is None or price is None:
+            if (
+                timestamp is None
+                or price is None
+            ):
                 raise ValueError(
                     "Delta before calibration"
                 )
@@ -352,7 +364,10 @@ def rebuild_state_from_history():
                 f"Unknown record marker: {record}"
             )
 
-    if timestamp is None or price is None:
+    if (
+        timestamp is None
+        or price is None
+    ):
         raise ValueError(
             "History contains no usable data"
         )
@@ -394,15 +409,19 @@ def load_history_from_b2():
             f"{B2_HISTORY_FILENAME}..."
         )
 
-        downloaded = b2_bucket.download_file_by_name(
-            B2_HISTORY_FILENAME
+        downloaded = (
+            b2_bucket.download_file_by_name(
+                B2_HISTORY_FILENAME
+            )
         )
 
         data = downloaded.response.read()
 
         if not data:
+
             print(
-                "B2 history file exists but is empty."
+                "B2 history file exists "
+                "but is empty."
             )
 
             return
@@ -421,9 +440,9 @@ def load_history_from_b2():
 
     except Exception as e:
 
-        # A missing file is expected on the very first run.
         error_text = str(e).lower()
 
+        # Missing file is expected on the first run.
         if (
             "not found" in error_text
             or "404" in error_text
@@ -441,8 +460,6 @@ def load_history_from_b2():
             f"B2 history download failed: {e}"
         )
 
-        # Don't silently continue with partially
-        # loaded/corrupt data.
         raise
 
 
@@ -502,14 +519,19 @@ def decode_history(
 
                 timestamp, price = struct.unpack(
                     "<dQ",
-                    compressed_data[pos:pos + 16]
+                    compressed_data[
+                        pos:pos + 16
+                    ]
                 )
 
                 pos += 16
 
             elif record == ord("D"):
 
-                if timestamp is None or price is None:
+                if (
+                    timestamp is None
+                    or price is None
+                ):
                     raise ValueError(
                         "Delta before calibration"
                     )
@@ -554,7 +576,8 @@ def decode_history(
                 continue
 
             if (
-                timestamp - bucket[0]["time"]
+                timestamp
+                - bucket[0]["time"]
                 >= granularity
             ):
 
@@ -615,8 +638,10 @@ def get_elytra_price():
     return next(
         item["unitPrice"]
         for item in response.json()
-        if item["itemName"] == "elytra"
-        and not item["isStale"]
+        if (
+            item["itemName"] == "elytra"
+            and not item["isStale"]
+        )
     )
 
 
@@ -663,7 +688,12 @@ def collector():
 
 def b2_uploader():
 
+    # Wait 30 minutes before the first upload.
     while True:
+
+        time.sleep(
+            B2_UPLOAD_INTERVAL
+        )
 
         try:
 
@@ -674,10 +704,6 @@ def b2_uploader():
             print(
                 f"B2 upload failed: {e}"
             )
-
-        time.sleep(
-            B2_UPLOAD_INTERVAL
-        )
 
 
 # ============================================================
@@ -987,11 +1013,16 @@ let chartHistory = [];
 
 function smoothData(data, level){
 
-    if(level === 0 || data.length < 3)
+    if(
+        level === 0
+        || data.length < 3
+    ){
 
         return data.map(
             x => x.price
         );
+
+    }
 
 
     const radius = level * 3;
@@ -1281,11 +1312,13 @@ async function update(){
             );
 
 
-        if(!response.ok)
+        if(!response.ok){
 
             throw new Error(
                 "HTTP " + response.status
             );
+
+        }
 
 
         chartHistory =
@@ -1454,30 +1487,26 @@ setInterval(
 @app.route("/history")
 def history_endpoint():
 
-    selected_range =
-        request.args.get(
-            "range",
-            "hour"
-        )
+    selected_range = request.args.get(
+        "range",
+        "hour"
+    )
 
     if selected_range not in DEFAULT_GRANULARITY:
 
         selected_range = "hour"
 
 
-    granularity =
-        request.args.get(
-            "granularity",
-            type=int
-        )
-
+    granularity = request.args.get(
+        "granularity",
+        type=int
+    )
 
     if granularity not in VALID_GRANULARITIES:
 
-        granularity =
-            DEFAULT_GRANULARITY[
-                selected_range
-            ]
+        granularity = DEFAULT_GRANULARITY[
+            selected_range
+        ]
 
 
     if selected_range == "max":
@@ -1486,10 +1515,10 @@ def history_endpoint():
 
     else:
 
-        start_time =
-            time.time() - TIME_RANGES[
-                selected_range
-            ]
+        start_time = (
+            time.time()
+            - TIME_RANGES[selected_range]
+        )
 
 
     return jsonify(
@@ -1548,9 +1577,8 @@ def stats():
 
 if __name__ == "__main__":
 
-    # Restore the previous history BEFORE starting
-    # the collector, so new samples continue the
-    # existing history correctly.
+    # Restore previous history BEFORE
+    # starting the collector.
     load_history_from_b2()
 
 
