@@ -868,22 +868,46 @@ def upload_history_to_b2():
 
 def get_elytra_price():
 
+    print("DEBUG: requesting Donut API...")
+
     response = requests.get(
         API_URL,
         headers=HEADERS,
         timeout=10
     )
 
+    print(
+        f"DEBUG: Donut API status = {response.status_code}"
+    )
+
     response.raise_for_status()
 
-    return next(
-        item["unitPrice"]
-        for item in response.json()
-        if (
-            item["itemName"] == "elytra"
-            and not item["isStale"]
-        )
+    data = response.json()
+
+    print(
+        f"DEBUG: API returned {len(data)} items"
     )
+
+    for item in data:
+
+        print(
+            f"DEBUG: item={item.get('itemName')} "
+            f"price={item.get('unitPrice')} "
+            f"stale={item.get('isStale')}"
+        )
+
+        if (
+            item.get("itemName") == "elytra"
+            and not item.get("isStale")
+        ):
+
+            return item["unitPrice"]
+
+    raise ValueError(
+        "Elytra was not found in the API response "
+        "as a non-stale item."
+    )
+//temprary code here
 
 
 # ============================================================
