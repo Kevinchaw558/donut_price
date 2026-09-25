@@ -476,45 +476,29 @@ def rebuild_state_from_history():
 def load_history_from_b2():
 
     global compressed_data
+    global current_price
+    global current_timestamp
+    global last_calibration
+
+    print(
+        f"Checking B2 for {B2_HISTORY_FILENAME}..."
+    )
 
     try:
 
-        print(
-            f"Checking B2 for "
-            f"{B2_HISTORY_FILENAME}..."
-        )
-
-        started = time.time()
-
-        downloaded = (
-            b2_bucket.download_file_by_name(
-                B2_HISTORY_FILENAME
-            )
-        )
-
-        print(
-            "B2 download started. "
-            "Waiting for file contents..."
+        downloaded = b2_bucket.download_file_by_name(
+            B2_HISTORY_FILENAME
         )
 
         data = downloaded.response.read()
 
-        elapsed = time.time() - started
-
         if not data:
 
             print(
-                "B2 history file exists "
-                "but is empty."
+                "B2 history file exists but is empty."
             )
 
             return
-
-        print(
-            f"B2 download complete: "
-            f"{len(data) / 1024 / 1024:.2f} MB "
-            f"in {elapsed:.1f}s"
-        )
 
         with data_lock:
 
@@ -524,37 +508,77 @@ def load_history_from_b2():
             rebuild_state_from_history()
 
         print(
-            "B2 history loaded successfully."
+            f"B2 history loaded successfully: "
+            f"{len(data) / 1024 / 1024:.2f} MB"
         )
 
     except Exception as e:
 
+        error_name = type(e).__name__
         error_text = str(e).lower()
 
-        # B2 uses "File not present" when the history
-        # object does not exist yet.
         if (
-            "file not present" in error_text
+            error_name == "FileNotPresent"
+            or "file not present" in error_text
             or "not found" in error_text
             or "404" in error_text
-            or "no such file" in error_text
         ):
 
             print(
-                "No existing B2 history found. "
-                "Starting a new history."
+                "No existing B2 history found."
+            )
+
+            # Create a valid one-record history.
+            timestamp = time.time()
+            price = 0
+
+            initial_data = bytearray()
+
+            initial_data.extend(b"C")
+
+            initial_data.extend(
+                struct.pack(
+                    "<dQ",
+                    timestamp,
+                    price
+                )
+            )
+
+            # Put it into RAM.
+            with data_lock:
+
+                compressed_data.clear()
+                compressed_data.extend(initial_data)
+
+                calibration_index.clear()
+                calibration_index.append(
+                    (timestamp, 0)
+                )
+
+                current_timestamp = timestamp
+                current_price = price
+                last_calibration = timestamp
+
+            # Create the file in B2.
+            b2_bucket.upload_bytes(
+                bytes(initial_data),
+                B2_HISTORY_FILENAME,
+                content_type="application/octet-stream"
+            )
+
+            print(
+                "Created new price_history.bin "
+                "with one initial timestamp."
             )
 
             return
 
         print(
-            f"B2 history download failed: "
-            f"{type(e).__name__}: {e}"
+            f"B2 history download failed "
+            f"({error_name}): {e}"
         )
 
         raise
-
-
 
 # ============================================================
 # FIND STARTING OFFSET
