@@ -5,9 +5,11 @@ import time
 import struct
 import statistics
 import os
+import bisect
 
 from b2sdk.v2 import InMemoryAccountInfo, B2Api
 from b2sdk.exception import FileNotPresent
+
 
 app = Flask(__name__)
 
@@ -34,7 +36,9 @@ b2_bucket = b2_api.get_bucket_by_name(
 )
 
 B2_HISTORY_FILENAME = "price_history.bin"
-B2_UPLOAD_INTERVAL = 1800  # 30 minutes
+
+# Upload the complete current history every 30 minutes.
+B2_UPLOAD_INTERVAL = 1800
 
 
 # ============================================================
@@ -44,7 +48,9 @@ B2_UPLOAD_INTERVAL = 1800  # 30 minutes
 @app.errorhandler(Exception)
 def handle_error(error):
     app.logger.exception("Unhandled error")
-    return jsonify({"error": str(error)}), 500
+    return jsonify({
+        "error": str(error)
+    }), 500
 
 
 # ============================================================
@@ -55,8 +61,14 @@ API_URL = "https://api.donut.auction/v2/tickers/"
 
 SAMPLE_INTERVAL = 1
 CALIBRATION_INTERVAL = 1800
+
+# Prices are stored divided by 100,000.
 PRICE_DIVISOR = 100_000
 
+
+# ============================================================
+# GRAPH CONFIGURATION
+# ============================================================
 
 DEFAULT_GRANULARITY = {
     "minute": 1,
@@ -89,6 +101,10 @@ VALID_GRANULARITIES = {
 }
 
 
+# ============================================================
+# HTTP HEADERS
+# ============================================================
+
 HEADERS = {
     "Accept": "*/*",
     "Accept-Language": "en-US,en;q=0.9",
@@ -111,20 +127,43 @@ HEADERS = {
 
 # Binary format:
 #
-# C + 8-byte timestamp + 8-byte absolute price
-# D + variable-length signed price delta
+# Calibration:
 #
-# Calibration records reset the timestamp and price.
-# This makes the stream resilient to missed samples.
+#   C
+#   8-byte timestamp
+#   8-byte absolute compressed price
+#
+#
+# Delta:
+#
+#   D
+#   variable-length signed price delta
+#
+#
+# A calibration resets both timestamp and price.
+#
+# This allows us to recover from missed samples and also gives
+# us anchor points that can be used to avoid decoding the entire
+# history for every graph request.
+
 
 compressed_data = bytearray()
 
-# (timestamp, byte_offset)
+
+# Sorted by timestamp:
+#
+# [
+#     (timestamp, byte_offset),
+#     ...
+# ]
+#
 calibration_index = []
+
 
 current_price = None
 current_timestamp = None
 last_calibration = None
+
 
 data_lock = threading.RLock()
 
@@ -146,31 +185,42 @@ def decompress_price(price):
 # ============================================================
 
 def write_delta(delta):
+
     compressed_data.append(ord("D"))
 
     # ZigZag encoding.
     value = (delta << 1) ^ (delta >> 63)
 
     while value >= 128:
-        compressed_data.append((value & 127) | 128)
+
+        compressed_data.append(
+            (value & 127) | 128
+        )
+
         value >>= 7
 
     compressed_data.append(value)
 
 
 def read_delta(data, pos):
+
     value = 0
     shift = 0
 
     while True:
 
         if pos >= len(data):
-            raise ValueError("Incomplete delta")
+            raise ValueError(
+                "Incomplete delta"
+            )
 
         byte = data[pos]
         pos += 1
 
-        value |= (byte & 127) << shift
+        value |= (
+            (byte & 127)
+            << shift
+        )
 
         if not byte & 128:
             break
@@ -182,7 +232,10 @@ def read_delta(data, pos):
                 "Invalid/corrupt delta"
             )
 
-    delta = (value >> 1) ^ -(value & 1)
+    delta = (
+        (value >> 1)
+        ^ -(value & 1)
+    )
 
     return delta, pos
 
@@ -206,7 +259,10 @@ def write_calibration(timestamp, price):
     )
 
     calibration_index.append(
-        (timestamp, offset)
+        (
+            timestamp,
+            offset
+        )
     )
 
 
@@ -266,7 +322,7 @@ def add_price(timestamp, real_price):
 
 
 # ============================================================
-# RESTORE STATE FROM HISTORY
+# RESTORE STATE / BUILD CALIBRATION INDEX
 # ============================================================
 
 def rebuild_state_from_history():
@@ -283,9 +339,15 @@ def rebuild_state_from_history():
         current_timestamp = None
         last_calibration = None
 
-        print("B2 history is empty.")
+        print(
+            "B2 history is empty."
+        )
 
         return
+
+    print(
+        "Scanning history and rebuilding index..."
+    )
 
     pos = 0
 
@@ -296,16 +358,23 @@ def rebuild_state_from_history():
 
     records = 0
 
-    while pos < len(compressed_data):
+    data_length = len(compressed_data)
+
+    while pos < data_length:
 
         record_offset = pos
 
         record = compressed_data[pos]
         pos += 1
 
+        # ----------------------------------------------------
+        # CALIBRATION
+        # ----------------------------------------------------
+
         if record == ord("C"):
 
-            if pos + 16 > len(compressed_data):
+            if pos + 16 > data_length:
+
                 raise ValueError(
                     "Incomplete calibration record"
                 )
@@ -330,12 +399,17 @@ def rebuild_state_from_history():
 
             records += 1
 
+        # ----------------------------------------------------
+        # DELTA
+        # ----------------------------------------------------
+
         elif record == ord("D"):
 
             if (
                 timestamp is None
                 or price is None
             ):
+
                 raise ValueError(
                     "Delta before calibration"
                 )
@@ -352,6 +426,7 @@ def rebuild_state_from_history():
                 price < 0
                 or price > 0xFFFFFFFFFFFFFFFF
             ):
+
                 raise ValueError(
                     f"Invalid decoded price: {price}"
                 )
@@ -368,6 +443,7 @@ def rebuild_state_from_history():
         timestamp is None
         or price is None
     ):
+
         raise ValueError(
             "History contains no usable data"
         )
@@ -409,13 +485,22 @@ def load_history_from_b2():
             f"{B2_HISTORY_FILENAME}..."
         )
 
+        started = time.time()
+
         downloaded = (
             b2_bucket.download_file_by_name(
                 B2_HISTORY_FILENAME
             )
         )
 
+        print(
+            "B2 download started. "
+            "Waiting for file contents..."
+        )
+
         data = downloaded.response.read()
+
+        elapsed = time.time() - started
 
         if not data:
 
@@ -426,6 +511,12 @@ def load_history_from_b2():
 
             return
 
+        print(
+            f"B2 download complete: "
+            f"{len(data) / 1024 / 1024:.2f} MB "
+            f"in {elapsed:.1f}s"
+        )
+
         with data_lock:
 
             compressed_data.clear()
@@ -434,9 +525,9 @@ def load_history_from_b2():
             rebuild_state_from_history()
 
         print(
-            f"B2 history loaded successfully: "
-            f"{len(data) / 1024 / 1024:.2f} MB"
+            "B2 history loaded successfully."
         )
+
     except FileNotPresent:
 
         print(
@@ -444,15 +535,53 @@ def load_history_from_b2():
             "Starting a new history."
         )
 
-        return
-
     except Exception as e:
 
         print(
-            f"B2 history download failed: {e}"
+            f"B2 history download failed: "
+            f"{type(e).__name__}: {e}"
         )
 
         raise
+
+
+# ============================================================
+# FIND STARTING OFFSET
+# ============================================================
+
+def find_start_offset(start_time):
+
+    """
+    Find the calibration immediately before start_time.
+
+    This is the important optimization.
+
+    Previously /history decoded the entire file starting
+    from byte 0.
+
+    Now we jump to the nearest calibration before the
+    requested time and decode only from there.
+    """
+
+    if not calibration_index:
+
+        return 0
+
+    timestamps = [
+        item[0]
+        for item in calibration_index
+    ]
+
+    index = bisect.bisect_right(
+        timestamps,
+        start_time
+    ) - 1
+
+    if index < 0:
+
+        return 0
+
+    return calibration_index[index][1]
 
 
 # ============================================================
@@ -464,122 +593,197 @@ def decode_history(
     granularity=1
 ):
 
+    # --------------------------------------------------------
+    # Take a snapshot of the data.
+    #
+    # This prevents us from holding data_lock while doing
+    # potentially expensive decoding.
+    # --------------------------------------------------------
+
     with data_lock:
 
         if not compressed_data:
             return []
 
+        data = bytes(compressed_data)
+
+        index = list(calibration_index)
+
+    # --------------------------------------------------------
+    # Find the closest calibration before the requested time.
+    # --------------------------------------------------------
+
+    if start_time is None:
+
         pos = 0
 
-        timestamp = None
-        price = None
+    elif index:
 
-        bucket = []
-        results = []
+        timestamps = [
+            item[0]
+            for item in index
+        ]
 
-        def finish_bucket():
+        calibration_number = (
+            bisect.bisect_right(
+                timestamps,
+                start_time
+            ) - 1
+        )
 
-            if not bucket:
-                return
+        if calibration_number < 0:
 
-            values = [
-                x["price"]
-                for x in bucket
-            ]
+            pos = 0
 
-            results.append({
-                "time": bucket[-1]["time"],
-                "price": bucket[-1]["price"],
-                "min": min(values),
-                "max": max(values),
-                "median": statistics.median(values)
-            })
+        else:
 
-            bucket.clear()
+            pos = index[
+                calibration_number
+            ][1]
 
-        while pos < len(compressed_data):
+    else:
 
-            record = compressed_data[pos]
-            pos += 1
+        pos = 0
 
-            if record == ord("C"):
+    # --------------------------------------------------------
+    # Decode from the selected calibration.
+    # --------------------------------------------------------
 
-                if pos + 16 > len(compressed_data):
-                    raise ValueError(
-                        "Incomplete calibration record"
-                    )
+    timestamp = None
+    price = None
 
-                timestamp, price = struct.unpack(
-                    "<dQ",
-                    compressed_data[
-                        pos:pos + 16
-                    ]
-                )
+    bucket = []
+    results = []
 
-                pos += 16
+    def finish_bucket():
 
-            elif record == ord("D"):
+        if not bucket:
+            return
 
-                if (
-                    timestamp is None
-                    or price is None
-                ):
-                    raise ValueError(
-                        "Delta before calibration"
-                    )
+        values = [
+            x["price"]
+            for x in bucket
+        ]
 
-                delta, pos = read_delta(
-                    compressed_data,
-                    pos
-                )
+        results.append({
+            "time": bucket[-1]["time"],
+            "price": bucket[-1]["price"],
+            "min": min(values),
+            "max": max(values),
+            "median": statistics.median(values)
+        })
 
-                price += delta
-                timestamp += SAMPLE_INTERVAL
+        bucket.clear()
 
-                if (
-                    price < 0
-                    or price > 0xFFFFFFFFFFFFFFFF
-                ):
-                    raise ValueError(
-                        f"Invalid decoded price: {price}"
-                    )
+    data_length = len(data)
 
-            else:
+    while pos < data_length:
+
+        record = data[pos]
+        pos += 1
+
+        # ----------------------------------------------------
+        # CALIBRATION
+        # ----------------------------------------------------
+
+        if record == ord("C"):
+
+            if pos + 16 > data_length:
 
                 raise ValueError(
-                    f"Unknown record marker: {record}"
+                    "Incomplete calibration record"
                 )
 
-            if (
-                start_time is not None
-                and timestamp < start_time
-            ):
-                continue
+            timestamp, price = struct.unpack(
+                "<dQ",
+                data[
+                    pos:pos + 16
+                ]
+            )
 
-            point = {
-                "time": timestamp,
-                "price": decompress_price(price)
-            }
+            pos += 16
 
-            if not bucket:
+        # ----------------------------------------------------
+        # DELTA
+        # ----------------------------------------------------
 
-                bucket.append(point)
-
-                continue
+        elif record == ord("D"):
 
             if (
-                timestamp
-                - bucket[0]["time"]
-                >= granularity
+                timestamp is None
+                or price is None
             ):
 
-                finish_bucket()
+                raise ValueError(
+                    "Delta before calibration"
+                )
+
+            delta, pos = read_delta(
+                data,
+                pos
+            )
+
+            price += delta
+            timestamp += SAMPLE_INTERVAL
+
+            if (
+                price < 0
+                or price > 0xFFFFFFFFFFFFFFFF
+            ):
+
+                raise ValueError(
+                    f"Invalid decoded price: {price}"
+                )
+
+        else:
+
+            raise ValueError(
+                f"Unknown record marker: {record}"
+            )
+
+        # ----------------------------------------------------
+        # Ignore points before requested range.
+        # ----------------------------------------------------
+
+        if (
+            start_time is not None
+            and timestamp < start_time
+        ):
+
+            continue
+
+        point = {
+            "time": timestamp,
+            "price": decompress_price(price)
+        }
+
+        # ----------------------------------------------------
+        # Start first bucket.
+        # ----------------------------------------------------
+
+        if not bucket:
 
             bucket.append(point)
 
-        finish_bucket()
+            continue
 
-        return results
+        # ----------------------------------------------------
+        # Start a new bucket when granularity is reached.
+        # ----------------------------------------------------
+
+        if (
+            timestamp
+            - bucket[0]["time"]
+            >= granularity
+        ):
+
+            finish_bucket()
+
+        bucket.append(point)
+
+    finish_bucket()
+
+    return results
 
 
 # ============================================================
@@ -601,15 +805,25 @@ def upload_history_to_b2():
 
         return
 
+    started = time.time()
+
+    print(
+        f"Starting B2 upload: "
+        f"{len(data) / 1024 / 1024:.2f} MB"
+    )
+
     b2_bucket.upload_bytes(
         data,
         B2_HISTORY_FILENAME,
         content_type="application/octet-stream"
     )
 
+    elapsed = time.time() - started
+
     print(
         f"B2 upload complete: "
-        f"{len(data) / 1024 / 1024:.2f} MB"
+        f"{len(data) / 1024 / 1024:.2f} MB "
+        f"in {elapsed:.1f}s"
     )
 
 
@@ -645,6 +859,8 @@ def collector():
 
     while True:
 
+        started = time.time()
+
         try:
 
             price = get_elytra_price()
@@ -659,18 +875,26 @@ def collector():
 
             print(
                 f"Elytra: {price:,} | "
-                f"RAM: "
+                f"History: "
                 f"{size / 1024 / 1024:.2f} MB"
             )
 
         except Exception as e:
 
             print(
-                f"Error collecting price: {e}"
+                f"Error collecting price: "
+                f"{type(e).__name__}: {e}"
             )
 
+        elapsed = time.time() - started
+
+        sleep_time = max(
+            0,
+            SAMPLE_INTERVAL - elapsed
+        )
+
         time.sleep(
-            SAMPLE_INTERVAL
+            sleep_time
         )
 
 
@@ -680,7 +904,7 @@ def collector():
 
 def b2_uploader():
 
-    # Wait 30 minutes before the first upload.
+    # Wait 30 minutes before first upload.
     while True:
 
         time.sleep(
@@ -694,7 +918,8 @@ def b2_uploader():
         except Exception as e:
 
             print(
-                f"B2 upload failed: {e}"
+                f"B2 upload failed: "
+                f"{type(e).__name__}: {e}"
             )
 
 
@@ -708,6 +933,7 @@ def home():
     return render_template_string("""
 <!DOCTYPE html>
 <html>
+
 <head>
 
 <title>Donut Elytra Price</title>
@@ -806,9 +1032,11 @@ canvas{
 
 </head>
 
+
 <body>
 
 <h1>Donut SMP Elytra Price</h1>
+
 
 <div id="price">
     Loading...
@@ -1001,6 +1229,14 @@ let selectedGranularity =
 let selectedSmoothness = 0;
 
 let chartHistory = [];
+
+
+// Prevent multiple history requests
+// from running simultaneously.
+
+let updateInProgress = false;
+
+let updateAgain = false;
 
 
 function smoothData(data, level){
@@ -1293,14 +1529,36 @@ ctx.addEventListener(
 
 async function update(){
 
+    // If an update is already running,
+    // don't start another one.
+
+    if(updateInProgress){
+
+        updateAgain = true;
+
+        return;
+
+    }
+
+
+    updateInProgress = true;
+
+
     try{
 
         const response =
             await fetch(
                 "/history?range="
-                + selectedRange
+                + encodeURIComponent(
+                    selectedRange
+                )
                 + "&granularity="
-                + selectedGranularity
+                + encodeURIComponent(
+                    selectedGranularity
+                ),
+                {
+                    cache:"no-store"
+                }
             );
 
 
@@ -1361,6 +1619,20 @@ async function update(){
             "History update failed:",
             error
         );
+
+    }
+    finally{
+
+        updateInProgress = false;
+
+
+        if(updateAgain){
+
+            updateAgain = false;
+
+            update();
+
+        }
 
     }
 
@@ -1460,6 +1732,7 @@ updateButtons();
 
 update();
 
+
 setInterval(
     update,
     5000
@@ -1468,6 +1741,7 @@ setInterval(
 </script>
 
 </body>
+
 </html>
 """)
 
@@ -1484,7 +1758,10 @@ def history_endpoint():
         "hour"
     )
 
-    if selected_range not in DEFAULT_GRANULARITY:
+    if (
+        selected_range
+        not in DEFAULT_GRANULARITY
+    ):
 
         selected_range = "hour"
 
@@ -1494,11 +1771,16 @@ def history_endpoint():
         type=int
     )
 
-    if granularity not in VALID_GRANULARITIES:
+    if (
+        granularity
+        not in VALID_GRANULARITIES
+    ):
 
-        granularity = DEFAULT_GRANULARITY[
-            selected_range
-        ]
+        granularity = (
+            DEFAULT_GRANULARITY[
+                selected_range
+            ]
+        )
 
 
     if selected_range == "max":
@@ -1509,16 +1791,34 @@ def history_endpoint():
 
         start_time = (
             time.time()
-            - TIME_RANGES[selected_range]
+            - TIME_RANGES[
+                selected_range
+            ]
         )
 
 
-    return jsonify(
-        decode_history(
-            start_time,
-            granularity
-        )
+    started = time.time()
+
+
+    result = decode_history(
+        start_time,
+        granularity
     )
+
+
+    elapsed = time.time() - started
+
+
+    print(
+        f"/history "
+        f"range={selected_range} "
+        f"granularity={granularity} "
+        f"points={len(result):,} "
+        f"time={elapsed:.3f}s"
+    )
+
+
+    return jsonify(result)
 
 
 # ============================================================
@@ -1538,7 +1838,8 @@ def stats():
             "compressed_mb":
                 round(
                     len(compressed_data)
-                    / 1024 / 1024,
+                    / 1024
+                    / 1024,
                     3
                 ),
 
@@ -1558,7 +1859,10 @@ def stats():
                     else decompress_price(
                         current_price
                     )
-                )
+                ),
+
+            "current_timestamp":
+                current_timestamp
 
         })
 
@@ -1569,24 +1873,77 @@ def stats():
 
 if __name__ == "__main__":
 
-    # Restore previous history BEFORE
-    # starting the collector.
+    print(
+        "================================================"
+    )
+
+    print(
+        "Starting Donut Elytra price tracker..."
+    )
+
+    print(
+        "Loading history from B2..."
+    )
+
+    print(
+        "================================================"
+    )
+
+
+    # --------------------------------------------------------
+    # IMPORTANT:
+    #
+    # Load old history BEFORE collector starts.
+    #
+    # This ensures the first new price continues from the
+    # restored state rather than creating a broken stream.
+    # --------------------------------------------------------
+
     load_history_from_b2()
 
 
+    print(
+        "History initialization complete."
+    )
+
+
+    # --------------------------------------------------------
+    # Start collector.
+    # --------------------------------------------------------
+
     threading.Thread(
         target=collector,
-        daemon=True
+        daemon=True,
+        name="price-collector"
     ).start()
 
+
+    # --------------------------------------------------------
+    # Start B2 uploader.
+    # --------------------------------------------------------
 
     threading.Thread(
         target=b2_uploader,
-        daemon=True
+        daemon=True,
+        name="b2-uploader"
     ).start()
+
+
+    print(
+        "Collector started."
+    )
+
+    print(
+        "B2 uploader started."
+    )
+
+    print(
+        "Web server starting..."
+    )
 
 
     app.run(
         host="0.0.0.0",
-        port=10000
+        port=10000,
+        threaded=True
     )
