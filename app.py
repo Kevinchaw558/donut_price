@@ -907,7 +907,7 @@ def get_elytra_price():
         "Elytra was not found in the API response "
         "as a non-stale item."
     )
-//temprary code here
+#temprary code here
 
 
 # ============================================================
