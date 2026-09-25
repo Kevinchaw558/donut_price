@@ -8,7 +8,6 @@ import os
 import bisect
 
 from b2sdk.v2 import InMemoryAccountInfo, B2Api
-from b2sdk.exception import FileNotPresent
 
 
 app = Flask(__name__)
@@ -528,14 +527,25 @@ def load_history_from_b2():
             "B2 history loaded successfully."
         )
 
-    except FileNotPresent:
-
-        print(
-            "No existing B2 history found. "
-            "Starting a new history."
-        )
-
     except Exception as e:
+
+        error_text = str(e).lower()
+
+        # B2 uses "File not present" when the history
+        # object does not exist yet.
+        if (
+            "file not present" in error_text
+            or "not found" in error_text
+            or "404" in error_text
+            or "no such file" in error_text
+        ):
+
+            print(
+                "No existing B2 history found. "
+                "Starting a new history."
+            )
+
+            return
 
         print(
             f"B2 history download failed: "
@@ -543,6 +553,7 @@ def load_history_from_b2():
         )
 
         raise
+
 
 
 # ============================================================
