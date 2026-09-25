@@ -492,12 +492,11 @@ def load_history_from_b2():
             B2_HISTORY_FILENAME
         )
 
-        with open(temp_filename, "wb") as f:
-
-            downloaded.save_to(f)
+        # b2sdk expects save_to() to receive a FILE PATH,
+        # not an open file object.
+        downloaded.save_to(temp_filename)
 
         with open(temp_filename, "rb") as f:
-
             data = f.read()
 
         if not data:
@@ -525,6 +524,7 @@ def load_history_from_b2():
         error_name = type(e).__name__
         error_text = str(e).lower()
 
+        # B2 file does not exist yet.
         if (
             error_name == "FileNotPresent"
             or "file not present" in error_text
@@ -536,6 +536,12 @@ def load_history_from_b2():
                 "No existing B2 history found."
             )
 
+            # Create a valid one-record history.
+            #
+            # Format:
+            # C
+            # + 8-byte timestamp
+            # + 8-byte compressed price
             timestamp = time.time()
             price = 0
 
@@ -568,6 +574,7 @@ def load_history_from_b2():
                 current_price = price
                 last_calibration = timestamp
 
+            # Create the initial B2 file immediately.
             b2_bucket.upload_bytes(
                 bytes(initial_data),
                 B2_HISTORY_FILENAME,
