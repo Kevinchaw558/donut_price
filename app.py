@@ -1674,8 +1674,7 @@ async function update(){
                 chartHistory[
                     chartHistory.length - 1
                 ].price;
-
-
+        
             document
                 .getElementById("price")
                 .textContent =
@@ -1683,6 +1682,13 @@ async function update(){
                     latest
                 ).toLocaleString()
                 + " coins";
+        
+        } else {
+        
+            document
+                .getElementById("price")
+                .textContent =
+                "No fresh data";
 
         }
 
