@@ -484,13 +484,21 @@ def load_history_from_b2():
         f"Checking B2 for {B2_HISTORY_FILENAME}..."
     )
 
+    temp_filename = "/tmp/price_history.bin"
+
     try:
 
         downloaded = b2_bucket.download_file_by_name(
             B2_HISTORY_FILENAME
         )
 
-        data = downloaded.response.read()
+        with open(temp_filename, "wb") as f:
+
+            downloaded.save_to(f)
+
+        with open(temp_filename, "rb") as f:
+
+            data = f.read()
 
         if not data:
 
@@ -528,7 +536,6 @@ def load_history_from_b2():
                 "No existing B2 history found."
             )
 
-            # Create a valid one-record history.
             timestamp = time.time()
             price = 0
 
@@ -544,13 +551,15 @@ def load_history_from_b2():
                 )
             )
 
-            # Put it into RAM.
             with data_lock:
 
                 compressed_data.clear()
-                compressed_data.extend(initial_data)
+                compressed_data.extend(
+                    initial_data
+                )
 
                 calibration_index.clear()
+
                 calibration_index.append(
                     (timestamp, 0)
                 )
@@ -559,7 +568,6 @@ def load_history_from_b2():
                 current_price = price
                 last_calibration = timestamp
 
-            # Create the file in B2.
             b2_bucket.upload_bytes(
                 bytes(initial_data),
                 B2_HISTORY_FILENAME,
