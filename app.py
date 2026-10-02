@@ -34,10 +34,40 @@ b2_bucket = b2_api.get_bucket_by_name(
     B2_BUCKET_NAME
 )
 
+
+# ------------------------------------------------------------
+# MAIN HISTORY FILE
+# ------------------------------------------------------------
+
 B2_HISTORY_FILENAME = "price_history.bin"
 
-# Upload the complete current history every 30 minutes.
-B2_UPLOAD_INTERVAL = 1800
+
+# ------------------------------------------------------------
+# MAIN HISTORY UPLOAD
+#
+# The complete history is uploaded every 30 minutes.
+# We clean up old B2 versions so this does not create
+# hundreds of old versions.
+# ------------------------------------------------------------
+
+B2_UPLOAD_INTERVAL = 30 * 60
+
+
+# ------------------------------------------------------------
+# RECOVERY SNAPSHOTS
+#
+# A snapshot is created every 6 hours.
+#
+# Snapshots older than 6 hours are deleted.
+#
+# Therefore there will normally be one snapshot available.
+# ------------------------------------------------------------
+
+B2_SNAPSHOT_PREFIX = "snapshots/price_history_"
+
+B2_SNAPSHOT_INTERVAL = 6 * 60 * 60
+
+B2_SNAPSHOT_RETENTION = 6 * 60 * 60
 
 
 # ============================================================
@@ -46,7 +76,9 @@ B2_UPLOAD_INTERVAL = 1800
 
 @app.errorhandler(Exception)
 def handle_error(error):
+
     app.logger.exception("Unhandled error")
+
     return jsonify({
         "error": str(error)
     }), 500
@@ -59,9 +91,9 @@ def handle_error(error):
 API_URL = "https://api.donut.auction/v2/tickers/"
 
 SAMPLE_INTERVAL = 1
+
 CALIBRATION_INTERVAL = 1800
 
-# Prices are stored divided by 100,000.
 PRICE_DIVISOR = 100_000
 
 
@@ -70,33 +102,55 @@ PRICE_DIVISOR = 100_000
 # ============================================================
 
 DEFAULT_GRANULARITY = {
+
     "minute": 1,
+
     "5minutes": 1,
+
     "hour": 60,
+
     "day": 300,
+
     "week": 3600,
+
     "month": 86400,
+
     "max": 86400
+
 }
 
 
 TIME_RANGES = {
+
     "minute": 60,
+
     "5minutes": 300,
+
     "hour": 3600,
+
     "day": 86400,
+
     "week": 604800,
+
     "month": 2592000
+
 }
 
 
 VALID_GRANULARITIES = {
+
     1,
+
     10,
+
     60,
+
     300,
+
     3600,
+
     86400
+
 }
 
 
@@ -105,46 +159,33 @@ VALID_GRANULARITIES = {
 # ============================================================
 
 HEADERS = {
+
     "Accept": "*/*",
+
     "Accept-Language": "en-US,en;q=0.9",
+
     "Cache-Control": "no-cache",
+
     "Content-Type": "application/json",
+
     "Origin": "https://donut.auction",
+
     "Pragma": "no-cache",
+
     "Referer": "https://donut.auction/",
+
     "User-Agent": (
         "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
         "AppleWebKit/537.36 (KHTML, like Gecko) "
         "Chrome/151.0.0.0 Safari/537.36"
     )
+
 }
 
 
 # ============================================================
 # COMPRESSED HISTORY
 # ============================================================
-
-# Binary format:
-#
-# Calibration:
-#
-#   C
-#   8-byte timestamp
-#   8-byte absolute compressed price
-#
-#
-# Delta:
-#
-#   D
-#   variable-length signed price delta
-#
-#
-# A calibration resets both timestamp and price.
-#
-# This allows us to recover from missed samples and also gives
-# us anchor points that can be used to avoid decoding the entire
-# history for every graph request.
-
 
 compressed_data = bytearray()
 
@@ -155,12 +196,14 @@ compressed_data = bytearray()
 #     (timestamp, byte_offset),
 #     ...
 # ]
-#
+
 calibration_index = []
 
 
 current_price = None
+
 current_timestamp = None
+
 last_calibration = None
 
 
@@ -172,10 +215,12 @@ data_lock = threading.RLock()
 # ============================================================
 
 def compress_price(price):
+
     return int(price) // PRICE_DIVISOR
 
 
 def decompress_price(price):
+
     return price * PRICE_DIVISOR
 
 
@@ -204,16 +249,19 @@ def write_delta(delta):
 def read_delta(data, pos):
 
     value = 0
+
     shift = 0
 
     while True:
 
         if pos >= len(data):
+
             raise ValueError(
                 "Incomplete delta"
             )
 
         byte = data[pos]
+
         pos += 1
 
         value |= (
@@ -222,11 +270,13 @@ def read_delta(data, pos):
         )
 
         if not byte & 128:
+
             break
 
         shift += 7
 
         if shift > 63:
+
             raise ValueError(
                 "Invalid/corrupt delta"
             )
@@ -278,6 +328,7 @@ def add_price(timestamp, real_price):
     price = compress_price(real_price)
 
     if price < 0:
+
         raise ValueError(
             "Price cannot be negative"
         )
@@ -317,6 +368,7 @@ def add_price(timestamp, real_price):
             )
 
         current_price = price
+
         current_timestamp = timestamp
 
 
@@ -335,14 +387,14 @@ def rebuild_state_from_history():
     if not compressed_data:
 
         current_price = None
+
         current_timestamp = None
+
         last_calibration = None
 
-        print(
-            "B2 history is empty."
+        raise ValueError(
+            "History is empty."
         )
-
-        return
 
     print(
         "Scanning history and rebuilding index..."
@@ -351,6 +403,7 @@ def rebuild_state_from_history():
     pos = 0
 
     timestamp = None
+
     price = None
 
     latest_calibration = None
@@ -364,7 +417,9 @@ def rebuild_state_from_history():
         record_offset = pos
 
         record = compressed_data[pos]
+
         pos += 1
+
 
         # ----------------------------------------------------
         # CALIBRATION
@@ -398,6 +453,7 @@ def rebuild_state_from_history():
 
             records += 1
 
+
         # ----------------------------------------------------
         # DELTA
         # ----------------------------------------------------
@@ -419,6 +475,7 @@ def rebuild_state_from_history():
             )
 
             price += delta
+
             timestamp += SAMPLE_INTERVAL
 
             if (
@@ -432,11 +489,13 @@ def rebuild_state_from_history():
 
             records += 1
 
+
         else:
 
             raise ValueError(
                 f"Unknown record marker: {record}"
             )
+
 
     if (
         timestamp is None
@@ -447,9 +506,13 @@ def rebuild_state_from_history():
             "History contains no usable data"
         )
 
+
     current_timestamp = timestamp
+
     current_price = price
+
     last_calibration = latest_calibration
+
 
     print(
         f"History restored: "
@@ -470,10 +533,10 @@ def rebuild_state_from_history():
 
 
 # ============================================================
-# DOWNLOAD HISTORY FROM B2
+# DOWNLOAD CURRENT MAIN HISTORY FROM B2
 # ============================================================
 
-def load_history_from_b2():
+def load_current_history_from_b2():
 
     global compressed_data
     global current_price
@@ -492,108 +555,650 @@ def load_history_from_b2():
             B2_HISTORY_FILENAME
         )
 
-        # b2sdk expects save_to() to receive a FILE PATH,
-        # not an open file object.
-        downloaded.save_to(temp_filename)
+        downloaded.save_to(
+            temp_filename
+        )
 
-        with open(temp_filename, "rb") as f:
+        with open(
+            temp_filename,
+            "rb"
+        ) as f:
+
             data = f.read()
+
 
         if not data:
 
-            print(
-                "B2 history file exists but is empty."
+            raise ValueError(
+                "B2 history file is empty."
             )
 
-            return
 
         with data_lock:
 
             compressed_data.clear()
-            compressed_data.extend(data)
 
+            compressed_data.extend(
+                data
+            )
+
+            # This validates the entire file.
             rebuild_state_from_history()
+
 
         print(
             f"B2 history loaded successfully: "
             f"{len(data) / 1024 / 1024:.2f} MB"
         )
 
+        return True
+
+
     except Exception as e:
 
-        error_name = type(e).__name__
-        error_text = str(e).lower()
-
-        # B2 file does not exist yet.
-        if (
-            error_name == "FileNotPresent"
-            or "file not present" in error_text
-            or "not found" in error_text
-            or "404" in error_text
-        ):
-
-            print(
-                "No existing B2 history found."
-            )
-
-            # Create a valid one-record history.
-            #
-            # Format:
-            # C
-            # + 8-byte timestamp
-            # + 8-byte compressed price
-            timestamp = time.time()
-            price = 0
-
-            initial_data = bytearray()
-
-            initial_data.extend(b"C")
-
-            initial_data.extend(
-                struct.pack(
-                    "<dQ",
-                    timestamp,
-                    price
-                )
-            )
-
-            with data_lock:
-
-                compressed_data.clear()
-                compressed_data.extend(
-                    initial_data
-                )
-
-                calibration_index.clear()
-
-                calibration_index.append(
-                    (timestamp, 0)
-                )
-
-                current_timestamp = timestamp
-                current_price = price
-                last_calibration = timestamp
-
-            # Create the initial B2 file immediately.
-            b2_bucket.upload_bytes(
-                bytes(initial_data),
-                B2_HISTORY_FILENAME,
-                content_type="application/octet-stream"
-            )
-
-            print(
-                "Created new price_history.bin "
-                "with one initial timestamp."
-            )
-
-            return
-
         print(
-            f"B2 history download failed "
-            f"({error_name}): {e}"
+            f"Current B2 history could not be loaded: "
+            f"{type(e).__name__}: {e}"
         )
 
-        raise
+        return False
+
+
+# ============================================================
+# CREATE NEW EMPTY HISTORY
+# ============================================================
+
+def create_new_history():
+
+    global compressed_data
+    global current_price
+    global current_timestamp
+    global last_calibration
+
+    timestamp = time.time()
+
+    price = 0
+
+    initial_data = bytearray()
+
+    initial_data.extend(b"C")
+
+    initial_data.extend(
+        struct.pack(
+            "<dQ",
+            timestamp,
+            price
+        )
+    )
+
+
+    with data_lock:
+
+        compressed_data.clear()
+
+        compressed_data.extend(
+            initial_data
+        )
+
+        calibration_index.clear()
+
+        calibration_index.append(
+            (
+                timestamp,
+                0
+            )
+        )
+
+        current_timestamp = timestamp
+
+        current_price = price
+
+        last_calibration = timestamp
+
+
+    print(
+        "Created new local history."
+    )
+
+
+    try:
+
+        b2_bucket.upload_bytes(
+            bytes(initial_data),
+            B2_HISTORY_FILENAME,
+            content_type="application/octet-stream"
+        )
+
+        print(
+            "Created new price_history.bin on B2."
+        )
+
+    except Exception as e:
+
+        print(
+            f"Warning: could not create initial B2 "
+            f"history: {e}"
+        )
+
+
+# ============================================================
+# LOAD SNAPSHOT
+# ============================================================
+
+def load_snapshot_from_b2(snapshot):
+
+    global compressed_data
+    global current_price
+    global current_timestamp
+    global last_calibration
+
+    temp_filename = (
+        "/tmp/price_history_snapshot.bin"
+    )
+
+    print(
+        f"Downloading recovery snapshot: "
+        f"{snapshot.file_name}"
+    )
+
+    downloaded = (
+        b2_bucket.download_file_by_id(
+            snapshot.id_
+        )
+    )
+
+    downloaded.save_to(
+        temp_filename
+    )
+
+    with open(
+        temp_filename,
+        "rb"
+    ) as f:
+
+        data = f.read()
+
+
+    if not data:
+
+        raise ValueError(
+            "Snapshot is empty."
+        )
+
+
+    with data_lock:
+
+        compressed_data.clear()
+
+        compressed_data.extend(
+            data
+        )
+
+        # Validate the snapshot.
+        rebuild_state_from_history()
+
+
+    print(
+        f"Recovery snapshot loaded successfully: "
+        f"{len(data) / 1024 / 1024:.2f} MB"
+    )
+
+
+# ============================================================
+# FIND NEWEST SNAPSHOT
+# ============================================================
+
+def get_snapshots():
+
+    snapshots = []
+
+    try:
+
+        for version, _folder in b2_bucket.ls(
+            "snapshots/",
+            latest_only=True,
+            recursive=True
+        ):
+
+            if (
+                version.action == "upload"
+                and version.file_name.startswith(
+                    B2_SNAPSHOT_PREFIX
+                )
+                and version.file_name.endswith(
+                    ".bin"
+                )
+            ):
+
+                snapshots.append(version)
+
+    except Exception as e:
+
+        print(
+            f"Could not list B2 snapshots: {e}"
+        )
+
+        return []
+
+
+    snapshots.sort(
+        key=lambda x: x.upload_timestamp or 0,
+        reverse=True
+    )
+
+    return snapshots
+
+
+# ============================================================
+# RECOVER FROM NEWEST SNAPSHOT
+# ============================================================
+
+def load_latest_snapshot_from_b2():
+
+    snapshots = get_snapshots()
+
+    if not snapshots:
+
+        print(
+            "No recovery snapshots found."
+        )
+
+        return False
+
+
+    newest = snapshots[0]
+
+    try:
+
+        load_snapshot_from_b2(
+            newest
+        )
+
+        print(
+            f"Recovered from snapshot: "
+            f"{newest.file_name}"
+        )
+
+        return True
+
+    except Exception as e:
+
+        print(
+            f"Newest snapshot failed validation: "
+            f"{type(e).__name__}: {e}"
+        )
+
+
+    # If the newest snapshot is corrupt, try older
+    # snapshots rather than giving up immediately.
+
+    for snapshot in snapshots[1:]:
+
+        try:
+
+            print(
+                f"Trying older snapshot: "
+                f"{snapshot.file_name}"
+            )
+
+            load_snapshot_from_b2(
+                snapshot
+            )
+
+            print(
+                f"Recovered from snapshot: "
+                f"{snapshot.file_name}"
+            )
+
+            return True
+
+        except Exception as e:
+
+            print(
+                f"Snapshot failed: "
+                f"{type(e).__name__}: {e}"
+            )
+
+
+    print(
+        "No usable recovery snapshots found."
+    )
+
+    return False
+
+
+# ============================================================
+# STARTUP RECOVERY
+# ============================================================
+
+def load_history_with_recovery():
+
+    print(
+        "================================================"
+    )
+
+    print(
+        "Loading history..."
+    )
+
+    print(
+        "================================================"
+    )
+
+
+    # --------------------------------------------------------
+    # FIRST: Try the normal main history.
+    # --------------------------------------------------------
+
+    if load_current_history_from_b2():
+
+        print(
+            "Main history is healthy."
+        )
+
+        return
+
+
+    # --------------------------------------------------------
+    # SECOND: Main history failed.
+    #
+    # Try the newest recovery snapshot.
+    # --------------------------------------------------------
+
+    print(
+        "Main history is unavailable or corrupt."
+    )
+
+    print(
+        "Attempting recovery from newest snapshot..."
+    )
+
+
+    if load_latest_snapshot_from_b2():
+
+        print(
+            "================================================"
+        )
+
+        print(
+            "RECOVERY SUCCESSFUL"
+        )
+
+        print(
+            "================================================"
+        )
+
+
+        # ----------------------------------------------------
+        # Promote recovered history back to the main file.
+        # ----------------------------------------------------
+
+        try:
+
+            upload_history_to_b2()
+
+            print(
+                "Recovered history uploaded as "
+                "the new main history."
+            )
+
+        except Exception as e:
+
+            print(
+                f"WARNING: recovered history could not "
+                f"be uploaded as main history: {e}"
+            )
+
+
+        return
+
+
+    # --------------------------------------------------------
+    # THIRD: Nothing exists.
+    #
+    # Start a brand-new history.
+    # --------------------------------------------------------
+
+    print(
+        "No usable main history or snapshots found."
+    )
+
+    print(
+        "Starting a new history."
+    )
+
+    create_new_history()
+
+
+# ============================================================
+# CLEAN OLD MAIN FILE VERSIONS
+# ============================================================
+
+def cleanup_old_history_versions():
+
+    print(
+        f"Cleaning old B2 versions of "
+        f"{B2_HISTORY_FILENAME}..."
+    )
+
+
+    try:
+
+        versions = list(
+            b2_bucket.list_file_versions(
+                B2_HISTORY_FILENAME
+            )
+        )
+
+    except Exception as e:
+
+        print(
+            f"Could not list old history versions: {e}"
+        )
+
+        return
+
+
+    if len(versions) <= 1:
+
+        print(
+            "No old main-history versions to delete."
+        )
+
+        return
+
+
+    # --------------------------------------------------------
+    # Sort newest first.
+    # --------------------------------------------------------
+
+    versions.sort(
+        key=lambda x: x.upload_timestamp or 0,
+        reverse=True
+    )
+
+
+    newest = versions[0]
+
+    deleted = 0
+
+
+    # --------------------------------------------------------
+    # Keep only the newest main-history version.
+    # --------------------------------------------------------
+
+    for version in versions[1:]:
+
+        try:
+
+            b2_bucket.delete_file_version(
+                version.id_,
+                version.file_name
+            )
+
+            deleted += 1
+
+        except Exception as e:
+
+            print(
+                f"Could not delete old version "
+                f"{version.id_}: {e}"
+            )
+
+
+    print(
+        f"Deleted {deleted} old main-history versions."
+    )
+
+    print(
+        f"Kept current version: {newest.id_}"
+    )
+
+
+# ============================================================
+# CREATE 6-HOUR RECOVERY SNAPSHOT
+# ============================================================
+
+def create_history_snapshot():
+
+    with data_lock:
+
+        data = bytes(
+            compressed_data
+        )
+
+
+    if not data:
+
+        print(
+            "Snapshot skipped: history is empty."
+        )
+
+        return
+
+
+    now = time.time()
+
+
+    snapshot_name = (
+
+        B2_SNAPSHOT_PREFIX
+
+        +
+
+        time.strftime(
+            "%Y%m%d_%H%M%S",
+            time.gmtime(now)
+        )
+
+        +
+
+        ".bin"
+
+    )
+
+
+    started = time.time()
+
+
+    print(
+        f"Creating recovery snapshot: "
+        f"{snapshot_name}"
+    )
+
+
+    b2_bucket.upload_bytes(
+        data,
+        snapshot_name,
+        content_type="application/octet-stream"
+    )
+
+
+    elapsed = time.time() - started
+
+
+    print(
+        f"Snapshot upload complete: "
+        f"{len(data) / 1024 / 1024:.2f} MB "
+        f"in {elapsed:.1f}s"
+    )
+
+
+    # --------------------------------------------------------
+    # Immediately clean snapshots older than 6 hours.
+    # --------------------------------------------------------
+
+    cleanup_old_snapshots()
+
+
+# ============================================================
+# DELETE SNAPSHOTS OLDER THAN 6 HOURS
+# ============================================================
+
+def cleanup_old_snapshots():
+
+    snapshots = get_snapshots()
+
+    if not snapshots:
+
+        return
+
+
+    cutoff = (
+        time.time()
+        - B2_SNAPSHOT_RETENTION
+    )
+
+
+    deleted = 0
+
+
+    for snapshot in snapshots:
+
+        upload_timestamp = (
+            snapshot.upload_timestamp
+            or 0
+        )
+
+
+        # ----------------------------------------------------
+        # Keep snapshots from the last 6 hours.
+        # ----------------------------------------------------
+
+        if upload_timestamp >= cutoff:
+
+            continue
+
+
+        try:
+
+            b2_bucket.delete_file_version(
+                snapshot.id_,
+                snapshot.file_name
+            )
+
+            deleted += 1
+
+            print(
+                f"Deleted old snapshot: "
+                f"{snapshot.file_name}"
+            )
+
+        except Exception as e:
+
+            print(
+                f"Could not delete old snapshot "
+                f"{snapshot.file_name}: {e}"
+            )
+
+
+    if deleted:
+
+        print(
+            f"Deleted {deleted} snapshot(s) "
+            f"older than 6 hours."
+        )
+
 
 # ============================================================
 # FIND STARTING OFFSET
@@ -601,35 +1206,30 @@ def load_history_from_b2():
 
 def find_start_offset(start_time):
 
-    """
-    Find the calibration immediately before start_time.
-
-    This is the important optimization.
-
-    Previously /history decoded the entire file starting
-    from byte 0.
-
-    Now we jump to the nearest calibration before the
-    requested time and decode only from there.
-    """
-
     if not calibration_index:
 
         return 0
 
+
     timestamps = [
+
         item[0]
+
         for item in calibration_index
+
     ]
+
 
     index = bisect.bisect_right(
         timestamps,
         start_time
     ) - 1
 
+
     if index < 0:
 
         return 0
+
 
     return calibration_index[index][1]
 
@@ -643,24 +1243,25 @@ def decode_history(
     granularity=1
 ):
 
-    # --------------------------------------------------------
-    # Take a snapshot of the data.
-    #
-    # This prevents us from holding data_lock while doing
-    # potentially expensive decoding.
-    # --------------------------------------------------------
-
     with data_lock:
 
         if not compressed_data:
+
             return []
 
-        data = bytes(compressed_data)
 
-        index = list(calibration_index)
+        data = bytes(
+            compressed_data
+        )
+
+
+        index = list(
+            calibration_index
+        )
+
 
     # --------------------------------------------------------
-    # Find the closest calibration before the requested time.
+    # Find closest calibration.
     # --------------------------------------------------------
 
     if start_time is None:
@@ -670,16 +1271,25 @@ def decode_history(
     elif index:
 
         timestamps = [
+
             item[0]
+
             for item in index
+
         ]
 
+
         calibration_number = (
+
             bisect.bisect_right(
                 timestamps,
                 start_time
-            ) - 1
+            )
+
+            - 1
+
         )
+
 
         if calibration_number < 0:
 
@@ -695,42 +1305,64 @@ def decode_history(
 
         pos = 0
 
-    # --------------------------------------------------------
-    # Decode from the selected calibration.
-    # --------------------------------------------------------
 
     timestamp = None
+
     price = None
 
     bucket = []
+
     results = []
+
 
     def finish_bucket():
 
         if not bucket:
+
             return
 
+
         values = [
+
             x["price"]
+
             for x in bucket
+
         ]
 
+
         results.append({
-            "time": bucket[-1]["time"],
-            "price": bucket[-1]["price"],
-            "min": min(values),
-            "max": max(values),
-            "median": statistics.median(values)
+
+            "time":
+                bucket[-1]["time"],
+
+            "price":
+                bucket[-1]["price"],
+
+            "min":
+                min(values),
+
+            "max":
+                max(values),
+
+            "median":
+                statistics.median(values)
+
         })
+
 
         bucket.clear()
 
+
     data_length = len(data)
+
 
     while pos < data_length:
 
         record = data[pos]
+
         pos += 1
+
 
         # ----------------------------------------------------
         # CALIBRATION
@@ -744,6 +1376,7 @@ def decode_history(
                     "Incomplete calibration record"
                 )
 
+
             timestamp, price = struct.unpack(
                 "<dQ",
                 data[
@@ -751,7 +1384,9 @@ def decode_history(
                 ]
             )
 
+
             pos += 16
+
 
         # ----------------------------------------------------
         # DELTA
@@ -768,13 +1403,17 @@ def decode_history(
                     "Delta before calibration"
                 )
 
+
             delta, pos = read_delta(
                 data,
                 pos
             )
 
+
             price += delta
+
             timestamp += SAMPLE_INTERVAL
+
 
             if (
                 price < 0
@@ -785,11 +1424,13 @@ def decode_history(
                     f"Invalid decoded price: {price}"
                 )
 
+
         else:
 
             raise ValueError(
                 f"Unknown record marker: {record}"
             )
+
 
         # ----------------------------------------------------
         # Ignore points before requested range.
@@ -802,10 +1443,17 @@ def decode_history(
 
             continue
 
+
         point = {
-            "time": timestamp,
-            "price": decompress_price(price)
+
+            "time":
+                timestamp,
+
+            "price":
+                decompress_price(price)
+
         }
+
 
         # ----------------------------------------------------
         # Start first bucket.
@@ -817,8 +1465,9 @@ def decode_history(
 
             continue
 
+
         # ----------------------------------------------------
-        # Start a new bucket when granularity is reached.
+        # Start a new bucket.
         # ----------------------------------------------------
 
         if (
@@ -829,22 +1478,28 @@ def decode_history(
 
             finish_bucket()
 
+
         bucket.append(point)
 
+
     finish_bucket()
+
 
     return results
 
 
 # ============================================================
-# UPLOAD HISTORY TO B2
+# UPLOAD MAIN HISTORY TO B2
 # ============================================================
 
 def upload_history_to_b2():
 
     with data_lock:
 
-        data = bytes(compressed_data)
+        data = bytes(
+            compressed_data
+        )
+
 
     if not data:
 
@@ -855,12 +1510,15 @@ def upload_history_to_b2():
 
         return
 
+
     started = time.time()
 
+
     print(
-        f"Starting B2 upload: "
+        f"Starting B2 main-history upload: "
         f"{len(data) / 1024 / 1024:.2f} MB"
     )
+
 
     b2_bucket.upload_bytes(
         data,
@@ -868,10 +1526,12 @@ def upload_history_to_b2():
         content_type="application/octet-stream"
     )
 
+
     elapsed = time.time() - started
 
+
     print(
-        f"B2 upload complete: "
+        f"B2 main-history upload complete: "
         f"{len(data) / 1024 / 1024:.2f} MB "
         f"in {elapsed:.1f}s"
     )
@@ -883,7 +1543,10 @@ def upload_history_to_b2():
 
 def get_elytra_price():
 
-    print("DEBUG: requesting Donut API...")
+    print(
+        "DEBUG: requesting Donut API..."
+    )
+
 
     response = requests.get(
         API_URL,
@@ -891,17 +1554,24 @@ def get_elytra_price():
         timeout=10
     )
 
+
     print(
-        f"DEBUG: Donut API status = {response.status_code}"
+        f"DEBUG: Donut API status = "
+        f"{response.status_code}"
     )
+
 
     response.raise_for_status()
 
+
     data = response.json()
 
+
     print(
-        f"DEBUG: API returned {len(data)} items"
+        f"DEBUG: API returned "
+        f"{len(data)} items"
     )
+
 
     for item in data:
 
@@ -911,6 +1581,7 @@ def get_elytra_price():
             f"stale={item.get('isStale')}"
         )
 
+
         if (
             item.get("itemName") == "elytra"
             and not item.get("isStale")
@@ -918,11 +1589,11 @@ def get_elytra_price():
 
             return item["unitPrice"]
 
+
     raise ValueError(
         "Elytra was not found in the API response "
         "as a non-stale item."
     )
-#temprary code here
 
 
 # ============================================================
@@ -935,23 +1606,31 @@ def collector():
 
         started = time.time()
 
+
         try:
 
             price = get_elytra_price()
+
 
             add_price(
                 time.time(),
                 price
             )
 
+
             with data_lock:
-                size = len(compressed_data)
+
+                size = len(
+                    compressed_data
+                )
+
 
             print(
                 f"Elytra: {price:,} | "
                 f"History: "
                 f"{size / 1024 / 1024:.2f} MB"
             )
+
 
         except Exception as e:
 
@@ -960,12 +1639,18 @@ def collector():
                 f"{type(e).__name__}: {e}"
             )
 
-        elapsed = time.time() - started
+
+        elapsed = (
+            time.time()
+            - started
+        )
+
 
         sleep_time = max(
             0,
             SAMPLE_INTERVAL - elapsed
         )
+
 
         time.sleep(
             sleep_time
@@ -973,26 +1658,59 @@ def collector():
 
 
 # ============================================================
-# B2 UPLOADER
+# B2 MAIN HISTORY UPLOADER
 # ============================================================
 
 def b2_uploader():
 
-    # Wait 30 minutes before first upload.
     while True:
 
         time.sleep(
             B2_UPLOAD_INTERVAL
         )
 
+
         try:
 
             upload_history_to_b2()
+
+
+            # ------------------------------------------------
+            # Keep only one version of the main file.
+            # ------------------------------------------------
+
+            cleanup_old_history_versions()
+
 
         except Exception as e:
 
             print(
                 f"B2 upload failed: "
+                f"{type(e).__name__}: {e}"
+            )
+
+
+# ============================================================
+# B2 6-HOUR SNAPSHOTTER
+# ============================================================
+
+def b2_snapshotter():
+
+    while True:
+
+        time.sleep(
+            B2_SNAPSHOT_INTERVAL
+        )
+
+
+        try:
+
+            create_history_snapshot()
+
+        except Exception as e:
+
+            print(
+                f"6-hour snapshot failed: "
                 f"{type(e).__name__}: {e}"
             )
 
@@ -1305,9 +2023,6 @@ let selectedSmoothness = 0;
 let chartHistory = [];
 
 
-// Prevent multiple history requests
-// from running simultaneously.
-
 let updateInProgress = false;
 
 let updateAgain = false;
@@ -1603,9 +2318,6 @@ ctx.addEventListener(
 
 async function update(){
 
-    // If an update is already running,
-    // don't start another one.
-
     if(updateInProgress){
 
         updateAgain = true;
@@ -1674,7 +2386,8 @@ async function update(){
                 chartHistory[
                     chartHistory.length - 1
                 ].price;
-        
+
+
             document
                 .getElementById("price")
                 .textContent =
@@ -1682,9 +2395,9 @@ async function update(){
                     latest
                 ).toLocaleString()
                 + " coins";
-        
+
         } else {
-        
+
             document
                 .getElementById("price")
                 .textContent =
@@ -1803,6 +2516,7 @@ document
                 updateButtons();
 
             }
+
         );
 
     });
@@ -1838,6 +2552,7 @@ def history_endpoint():
         "hour"
     )
 
+
     if (
         selected_range
         not in DEFAULT_GRANULARITY
@@ -1850,6 +2565,7 @@ def history_endpoint():
         "granularity",
         type=int
     )
+
 
     if (
         granularity
@@ -1870,10 +2586,15 @@ def history_endpoint():
     else:
 
         start_time = (
+
             time.time()
-            - TIME_RANGES[
+
+            -
+
+            TIME_RANGES[
                 selected_range
             ]
+
         )
 
 
@@ -1886,7 +2607,10 @@ def history_endpoint():
     )
 
 
-    elapsed = time.time() - started
+    elapsed = (
+        time.time()
+        - started
+    )
 
 
     print(
@@ -1962,24 +2686,18 @@ if __name__ == "__main__":
     )
 
     print(
-        "Loading history from B2..."
-    )
-
-    print(
         "================================================"
     )
 
 
     # --------------------------------------------------------
-    # IMPORTANT:
+    # Load main history.
     #
-    # Load old history BEFORE collector starts.
-    #
-    # This ensures the first new price continues from the
-    # restored state rather than creating a broken stream.
+    # If it is broken/missing, automatically use the newest
+    # recovery snapshot.
     # --------------------------------------------------------
 
-    load_history_from_b2()
+    load_history_with_recovery()
 
 
     print(
@@ -1988,7 +2706,29 @@ if __name__ == "__main__":
 
 
     # --------------------------------------------------------
-    # Start collector.
+    # IMPORTANT:
+    #
+    # Clean the old 372+ versions created by the previous
+    # system.
+    #
+    # This keeps ONLY the newest version of the main file.
+    # --------------------------------------------------------
+
+    cleanup_old_history_versions()
+
+
+    # --------------------------------------------------------
+    # Clean old recovery snapshots too.
+    #
+    # This is especially useful when the server starts after
+    # being offline for a while.
+    # --------------------------------------------------------
+
+    cleanup_old_snapshots()
+
+
+    # --------------------------------------------------------
+    # Start price collector.
     # --------------------------------------------------------
 
     threading.Thread(
@@ -1999,7 +2739,7 @@ if __name__ == "__main__":
 
 
     # --------------------------------------------------------
-    # Start B2 uploader.
+    # Start main B2 uploader.
     # --------------------------------------------------------
 
     threading.Thread(
@@ -2009,12 +2749,27 @@ if __name__ == "__main__":
     ).start()
 
 
+    # --------------------------------------------------------
+    # Start 6-hour snapshotter.
+    # --------------------------------------------------------
+
+    threading.Thread(
+        target=b2_snapshotter,
+        daemon=True,
+        name="b2-snapshotter"
+    ).start()
+
+
     print(
         "Collector started."
     )
 
     print(
         "B2 uploader started."
+    )
+
+    print(
+        "6-hour snapshotter started."
     )
 
     print(
