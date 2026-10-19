@@ -6,6 +6,7 @@ import struct
 import statistics
 import os
 import bisect
+import re
 
 from b2sdk.v2 import InMemoryAccountInfo, B2Api
 
@@ -54,20 +55,18 @@ B2_UPLOAD_INTERVAL = 30 * 60
 
 
 # ------------------------------------------------------------
-# RECOVERY SNAPSHOTS
+# INCREMENTAL BACKUPS
 #
-# A snapshot is created every 6 hours.
+# Each backup contains only new records since the previous
+# successful backup. Segments are independently decodable and
+# together reconstruct the complete compressed history.
 #
-# Snapshots older than 6 hours are deleted.
-#
-# Therefore there will normally be one snapshot available.
+# Backups are NEVER automatically deleted.
 # ------------------------------------------------------------
 
-B2_SNAPSHOT_PREFIX = "snapshots/price_history_"
-
-B2_SNAPSHOT_INTERVAL = 6 * 60 * 60
-
-B2_SNAPSHOT_RETENTION = 6 * 60 * 60
+B2_BACKUP_PREFIX = "backups/price_history_"
+B2_BACKUP_INTERVAL = 6 * 60 * 60
+B2_BACKUP_MAX_SEGMENT_SECONDS = 6 * 60 * 60
 
 
 # ============================================================
@@ -682,189 +681,309 @@ def create_new_history():
 
 
 # ============================================================
-# LOAD SNAPSHOT
+# READ COMPRESSED HISTORY INTO TIMESTAMPED RECORDS
 # ============================================================
 
-def load_snapshot_from_b2(snapshot):
+def decode_compressed_records(data):
+    """
+    Decode the existing C/D binary format into (timestamp, price)
+    records. Prices are kept in the compressed integer scale.
+    """
+    records = []
+    pos = 0
+    timestamp = None
+    price = None
+    data_length = len(data)
 
+    while pos < data_length:
+        marker = data[pos]
+        pos += 1
+
+        if marker == ord("C"):
+            if pos + 16 > data_length:
+                raise ValueError("Incomplete calibration record")
+            timestamp, price = struct.unpack("<dQ", data[pos:pos + 16])
+            pos += 16
+            records.append((timestamp, price))
+
+        elif marker == ord("D"):
+            if timestamp is None or price is None:
+                raise ValueError("Delta before calibration")
+            delta, pos = read_delta(data, pos)
+            price += delta
+            timestamp += SAMPLE_INTERVAL
+            if price < 0 or price > 0xFFFFFFFFFFFFFFFF:
+                raise ValueError(f"Invalid decoded price: {price}")
+            records.append((timestamp, price))
+
+        else:
+            raise ValueError(f"Unknown record marker: {marker}")
+
+    return records
+
+
+# ============================================================
+# ENCODE AN INDEPENDENT BACKUP SEGMENT
+# ============================================================
+
+def encode_backup_segment(records):
+    """
+    Encode records as a self-contained segment. The first sample
+    is always a calibration, so segments can be concatenated and
+    decoded independently of earlier segments.
+    """
+    if not records:
+        return b""
+
+    output = bytearray()
+    previous_timestamp = None
+    previous_price = None
+    last_calibration = None
+
+    for timestamp, price in records:
+        must_calibrate = (
+            previous_timestamp is None
+            or timestamp <= previous_timestamp
+            or timestamp - previous_timestamp > SAMPLE_INTERVAL * 1.5
+            or last_calibration is None
+            or timestamp - last_calibration >= CALIBRATION_INTERVAL
+        )
+
+        if must_calibrate:
+            output.append(ord("C"))
+            output.extend(struct.pack("<dQ", timestamp, price))
+            last_calibration = timestamp
+        else:
+            output.append(ord("D"))
+            delta = price - previous_price
+            value = (delta << 1) ^ (delta >> 63)
+            while value >= 128:
+                output.append((value & 127) | 128)
+                value >>= 7
+            output.append(value)
+
+        previous_timestamp = timestamp
+        previous_price = price
+
+    return bytes(output)
+
+
+# ============================================================
+# LIST INCREMENTAL BACKUP SEGMENTS
+# ============================================================
+
+def get_backup_segments():
+    """
+    Return the latest uploaded version of each backup segment,
+    ordered by its first timestamp. Never deletes any versions.
+    Segment names contain millisecond timestamps:
+      backups/price_history_<first_ms>_<last_ms>.bin
+    """
+    segments = []
+
+    try:
+        for version, _folder in b2_bucket.ls(
+            "backups/",
+            latest_only=True,
+            recursive=True
+        ):
+            name = version.file_name
+            if (
+                version.action == "upload"
+                and name.startswith(B2_BACKUP_PREFIX)
+                and name.endswith(".bin")
+            ):
+                match = re.search(r"_(\d+)_(\d+)\.bin$", name)
+                if match:
+                    first_ms = int(match.group(1))
+                    last_ms = int(match.group(2))
+                    segments.append({
+                        "version": version,
+                        "name": name,
+                        "first_timestamp": first_ms / 1000.0,
+                        "last_timestamp": last_ms / 1000.0,
+                    })
+                else:
+                    print(f"WARNING: unrecognized backup filename: {name}")
+
+    except Exception as e:
+        print(f"Could not list B2 incremental backups: {e}")
+        return []
+
+    segments.sort(key=lambda item: (
+        item["first_timestamp"],
+        item["last_timestamp"],
+        item["name"]
+    ))
+    return segments
+
+
+# ============================================================
+# UPLOAD NEW HISTORY AS NON-OVERLAPPING SEGMENTS
+# ============================================================
+
+def archive_new_history_to_b2():
+    """
+    Upload only records newer than the latest successfully archived
+    timestamp. If no segments exist, this performs a one-time
+    migration of the existing history into <=6-hour segments.
+    Failed uploads are not treated as archived; the next run retries
+    from the last segment that actually exists in B2.
+    """
+    with data_lock:
+        data = bytes(compressed_data)
+
+    if not data:
+        print("Incremental backup skipped: history is empty.")
+        return
+
+    records = decode_compressed_records(data)
+    if not records:
+        print("Incremental backup skipped: no decoded records.")
+        return
+
+    segments = get_backup_segments()
+    last_archived_timestamp = (
+        max(s["last_timestamp"] for s in segments)
+        if segments else None
+    )
+
+    if last_archived_timestamp is not None:
+        new_records = [
+            record for record in records
+            if record[0] > last_archived_timestamp
+        ]
+    else:
+        # One-time migration: preserve the existing history by
+        # splitting it into independent segments. This is not repeated
+        # once the segments exist.
+        new_records = records
+
+    if not new_records:
+        print("Incremental backup: no new records to archive.")
+        return
+
+    # Split by elapsed timestamp span, not by assuming that samples
+    # arrive exactly on schedule. Actual missing samples remain gaps.
+    chunks = []
+    chunk = []
+    chunk_start = None
+
+    for record in new_records:
+        timestamp = record[0]
+        if (
+            chunk
+            and chunk_start is not None
+            and timestamp - chunk_start >= B2_BACKUP_MAX_SEGMENT_SECONDS
+        ):
+            chunks.append(chunk)
+            chunk = []
+            chunk_start = None
+
+        if not chunk:
+            chunk_start = timestamp
+        chunk.append(record)
+
+    if chunk:
+        chunks.append(chunk)
+
+    for chunk_records in chunks:
+        segment_data = encode_backup_segment(chunk_records)
+        first_timestamp = chunk_records[0][0]
+        last_timestamp = chunk_records[-1][0]
+        first_ms = int(round(first_timestamp * 1000))
+        last_ms = int(round(last_timestamp * 1000))
+        segment_name = (
+            f"{B2_BACKUP_PREFIX}{first_ms}_{last_ms}.bin"
+        )
+
+        # If the upload succeeded before a prior process interruption,
+        # the segment is already present and must not be uploaded again.
+        existing_names = {s["name"] for s in get_backup_segments()}
+        if segment_name in existing_names:
+            print(f"Backup segment already exists; skipping: {segment_name}")
+            continue
+
+        started = time.time()
+        print(
+            f"Uploading incremental backup: {segment_name} "
+            f"({len(chunk_records):,} records, "
+            f"{len(segment_data) / 1024 / 1024:.2f} MB)"
+        )
+
+        # Do not delete or clear source/pending data. The source remains
+        # in compressed_data and is retried if this upload raises.
+        b2_bucket.upload_bytes(
+            segment_data,
+            segment_name,
+            content_type="application/octet-stream"
+        )
+
+        print(
+            f"Incremental backup uploaded: {segment_name} "
+            f"in {time.time() - started:.1f}s"
+        )
+
+
+# ============================================================
+# RECOVER FULL HISTORY FROM INCREMENTAL BACKUPS
+# ============================================================
+
+def load_incremental_backups_from_b2():
+    """
+    Download all available segments in chronological order and
+    concatenate them. Every segment begins with a calibration record,
+    so concatenation preserves the existing binary format.
+    """
     global compressed_data
     global current_price
     global current_timestamp
     global last_calibration
 
-    temp_filename = (
-        "/tmp/price_history_snapshot.bin"
-    )
-
-    print(
-        f"Downloading recovery snapshot: "
-        f"{snapshot.file_name}"
-    )
-
-    downloaded = (
-        b2_bucket.download_file_by_id(
-            snapshot.id_
-        )
-    )
-
-    downloaded.save_to(
-        temp_filename
-    )
-
-    with open(
-        temp_filename,
-        "rb"
-    ) as f:
-
-        data = f.read()
-
-
-    if not data:
-
-        raise ValueError(
-            "Snapshot is empty."
-        )
-
-
-    with data_lock:
-
-        compressed_data.clear()
-
-        compressed_data.extend(
-            data
-        )
-
-        # Validate the snapshot.
-        rebuild_state_from_history()
-
-
-    print(
-        f"Recovery snapshot loaded successfully: "
-        f"{len(data) / 1024 / 1024:.2f} MB"
-    )
-
-
-# ============================================================
-# FIND NEWEST SNAPSHOT
-# ============================================================
-
-def get_snapshots():
-
-    snapshots = []
-
-    try:
-
-        for version, _folder in b2_bucket.ls(
-            "snapshots/",
-            latest_only=True,
-            recursive=True
-        ):
-
-            if (
-                version.action == "upload"
-                and version.file_name.startswith(
-                    B2_SNAPSHOT_PREFIX
-                )
-                and version.file_name.endswith(
-                    ".bin"
-                )
-            ):
-
-                snapshots.append(version)
-
-    except Exception as e:
-
-        print(
-            f"Could not list B2 snapshots: {e}"
-        )
-
-        return []
-
-
-    snapshots.sort(
-        key=lambda x: x.upload_timestamp or 0,
-        reverse=True
-    )
-
-    return snapshots
-
-
-# ============================================================
-# RECOVER FROM NEWEST SNAPSHOT
-# ============================================================
-
-def load_latest_snapshot_from_b2():
-
-    snapshots = get_snapshots()
-
-    if not snapshots:
-
-        print(
-            "No recovery snapshots found."
-        )
-
+    segments = get_backup_segments()
+    if not segments:
+        print("No incremental backup segments found.")
         return False
 
+    combined = bytearray()
+    loaded = 0
 
-    newest = snapshots[0]
-
-    try:
-
-        load_snapshot_from_b2(
-            newest
+    for segment in segments:
+        print(f"Downloading backup segment: {segment['name']}")
+        downloaded = b2_bucket.download_file_by_id(
+            segment["version"].id_
         )
+        temp_filename = "/tmp/price_history_backup_segment.bin"
+        downloaded.save_to(temp_filename)
 
-        print(
-            f"Recovered from snapshot: "
-            f"{newest.file_name}"
-        )
+        with open(temp_filename, "rb") as f:
+            segment_data = f.read()
 
-        return True
-
-    except Exception as e:
-
-        print(
-            f"Newest snapshot failed validation: "
-            f"{type(e).__name__}: {e}"
-        )
-
-
-    # If the newest snapshot is corrupt, try older
-    # snapshots rather than giving up immediately.
-
-    for snapshot in snapshots[1:]:
-
-        try:
-
-            print(
-                f"Trying older snapshot: "
-                f"{snapshot.file_name}"
+        if not segment_data:
+            raise ValueError(
+                f"Backup segment is empty: {segment['name']}"
             )
 
-            load_snapshot_from_b2(
-                snapshot
+        # Validate each segment independently before combining it.
+        decoded = decode_compressed_records(segment_data)
+        if not decoded:
+            raise ValueError(
+                f"Backup segment has no records: {segment['name']}"
             )
 
-            print(
-                f"Recovered from snapshot: "
-                f"{snapshot.file_name}"
-            )
+        combined.extend(segment_data)
+        loaded += len(decoded)
 
-            return True
-
-        except Exception as e:
-
-            print(
-                f"Snapshot failed: "
-                f"{type(e).__name__}: {e}"
-            )
-
+    with data_lock:
+        compressed_data.clear()
+        compressed_data.extend(combined)
+        rebuild_state_from_history()
 
     print(
-        "No usable recovery snapshots found."
+        f"Recovered {loaded:,} records from {len(segments)} "
+        f"incremental backup segment(s)."
     )
-
-    return False
+    return True
 
 
 # ============================================================
@@ -872,332 +991,35 @@ def load_latest_snapshot_from_b2():
 # ============================================================
 
 def load_history_with_recovery():
-
-    print(
-        "================================================"
-    )
-
-    print(
-        "Loading history..."
-    )
-
-    print(
-        "================================================"
-    )
-
-
-    # --------------------------------------------------------
-    # FIRST: Try the normal main history.
-    # --------------------------------------------------------
+    print("================================================")
+    print("Loading history...")
+    print("================================================")
 
     if load_current_history_from_b2():
-
-        print(
-            "Main history is healthy."
-        )
-
+        print("Main history is healthy.")
         return
 
+    print("Main history is unavailable or corrupt.")
+    print("Attempting recovery from incremental backup segments...")
 
-    # --------------------------------------------------------
-    # SECOND: Main history failed.
-    #
-    # Try the newest recovery snapshot.
-    # --------------------------------------------------------
-
-    print(
-        "Main history is unavailable or corrupt."
-    )
-
-    print(
-        "Attempting recovery from newest snapshot..."
-    )
-
-
-    if load_latest_snapshot_from_b2():
-
-        print(
-            "================================================"
-        )
-
-        print(
-            "RECOVERY SUCCESSFUL"
-        )
-
-        print(
-            "================================================"
-        )
-
-
-        # ----------------------------------------------------
-        # Promote recovered history back to the main file.
-        # ----------------------------------------------------
+    if load_incremental_backups_from_b2():
+        print("================================================")
+        print("RECOVERY FROM INCREMENTAL BACKUPS SUCCESSFUL")
+        print("================================================")
 
         try:
-
             upload_history_to_b2()
-
-            print(
-                "Recovered history uploaded as "
-                "the new main history."
-            )
-
+            print("Recovered history uploaded as the new main history.")
         except Exception as e:
-
             print(
-                f"WARNING: recovered history could not "
-                f"be uploaded as main history: {e}"
+                "WARNING: recovered history could not be uploaded "
+                f"as main history: {e}"
             )
-
-
         return
 
-
-    # --------------------------------------------------------
-    # THIRD: Nothing exists.
-    #
-    # Start a brand-new history.
-    # --------------------------------------------------------
-
-    print(
-        "No usable main history or snapshots found."
-    )
-
-    print(
-        "Starting a new history."
-    )
-
+    print("No usable main history or incremental backups found.")
+    print("Starting a new history.")
     create_new_history()
-
-
-# ============================================================
-# CLEAN OLD MAIN FILE VERSIONS
-# ============================================================
-
-def cleanup_old_history_versions():
-
-    print(
-        f"Cleaning old B2 versions of "
-        f"{B2_HISTORY_FILENAME}..."
-    )
-
-
-    try:
-
-        versions = list(
-            b2_bucket.list_file_versions(
-                B2_HISTORY_FILENAME
-            )
-        )
-
-    except Exception as e:
-
-        print(
-            f"Could not list old history versions: {e}"
-        )
-
-        return
-
-
-    if len(versions) <= 1:
-
-        print(
-            "No old main-history versions to delete."
-        )
-
-        return
-
-
-    # --------------------------------------------------------
-    # Sort newest first.
-    # --------------------------------------------------------
-
-    versions.sort(
-        key=lambda x: x.upload_timestamp or 0,
-        reverse=True
-    )
-
-
-    newest = versions[0]
-
-    deleted = 0
-
-
-    # --------------------------------------------------------
-    # Keep only the newest main-history version.
-    # --------------------------------------------------------
-
-    for version in versions[1:]:
-
-        try:
-
-            b2_bucket.delete_file_version(
-                version.id_,
-                version.file_name
-            )
-
-            deleted += 1
-
-        except Exception as e:
-
-            print(
-                f"Could not delete old version "
-                f"{version.id_}: {e}"
-            )
-
-
-    print(
-        f"Deleted {deleted} old main-history versions."
-    )
-
-    print(
-        f"Kept current version: {newest.id_}"
-    )
-
-
-# ============================================================
-# CREATE 6-HOUR RECOVERY SNAPSHOT
-# ============================================================
-
-def create_history_snapshot():
-
-    with data_lock:
-
-        data = bytes(
-            compressed_data
-        )
-
-
-    if not data:
-
-        print(
-            "Snapshot skipped: history is empty."
-        )
-
-        return
-
-
-    now = time.time()
-
-
-    snapshot_name = (
-
-        B2_SNAPSHOT_PREFIX
-
-        +
-
-        time.strftime(
-            "%Y%m%d_%H%M%S",
-            time.gmtime(now)
-        )
-
-        +
-
-        ".bin"
-
-    )
-
-
-    started = time.time()
-
-
-    print(
-        f"Creating recovery snapshot: "
-        f"{snapshot_name}"
-    )
-
-
-    b2_bucket.upload_bytes(
-        data,
-        snapshot_name,
-        content_type="application/octet-stream"
-    )
-
-
-    elapsed = time.time() - started
-
-
-    print(
-        f"Snapshot upload complete: "
-        f"{len(data) / 1024 / 1024:.2f} MB "
-        f"in {elapsed:.1f}s"
-    )
-
-
-    # --------------------------------------------------------
-    # Immediately clean snapshots older than 6 hours.
-    # --------------------------------------------------------
-
-    cleanup_old_snapshots()
-
-
-# ============================================================
-# DELETE SNAPSHOTS OLDER THAN 6 HOURS
-# ============================================================
-
-def cleanup_old_snapshots():
-
-    snapshots = get_snapshots()
-
-    if not snapshots:
-
-        return
-
-
-    cutoff = (
-        time.time()
-        - B2_SNAPSHOT_RETENTION
-    )
-
-
-    deleted = 0
-
-
-    for snapshot in snapshots:
-
-        upload_timestamp = (
-            snapshot.upload_timestamp
-            or 0
-        )
-
-
-        # ----------------------------------------------------
-        # Keep snapshots from the last 6 hours.
-        # ----------------------------------------------------
-
-        if upload_timestamp >= cutoff:
-
-            continue
-
-
-        try:
-
-            b2_bucket.delete_file_version(
-                snapshot.id_,
-                snapshot.file_name
-            )
-
-            deleted += 1
-
-            print(
-                f"Deleted old snapshot: "
-                f"{snapshot.file_name}"
-            )
-
-        except Exception as e:
-
-            print(
-                f"Could not delete old snapshot "
-                f"{snapshot.file_name}: {e}"
-            )
-
-
-    if deleted:
-
-        print(
-            f"Deleted {deleted} snapshot(s) "
-            f"older than 6 hours."
-        )
 
 
 # ============================================================
@@ -1691,28 +1513,23 @@ def b2_uploader():
 
 
 # ============================================================
-# B2 6-HOUR SNAPSHOTTER
+# B2 6-HOUR INCREMENTAL BACKUP WORKER
 # ============================================================
 
-def b2_snapshotter():
-
+def b2_backup_worker():
+    # Run once on startup to migrate/catch up any unarchived history,
+    # then continue at six-hour intervals. A delayed run catches up from
+    # the latest archived timestamp; it does not create overlapping data.
     while True:
-
-        time.sleep(
-            B2_SNAPSHOT_INTERVAL
-        )
-
-
         try:
-
-            create_history_snapshot()
-
+            archive_new_history_to_b2()
         except Exception as e:
-
             print(
-                f"6-hour snapshot failed: "
+                f"Incremental backup failed (data retained for retry): "
                 f"{type(e).__name__}: {e}"
             )
+
+        time.sleep(B2_BACKUP_INTERVAL)
 
 
 # ============================================================
@@ -2717,15 +2534,8 @@ if __name__ == "__main__":
     cleanup_old_history_versions()
 
 
-    # --------------------------------------------------------
-    # Clean old recovery snapshots too.
-    #
-    # This is especially useful when the server starts after
-    # being offline for a while.
-    # --------------------------------------------------------
-
-    cleanup_old_snapshots()
-
+    # Incremental backup segments are retained indefinitely.
+    # No automatic backup deletion is performed.
 
     # --------------------------------------------------------
     # Start price collector.
@@ -2750,13 +2560,13 @@ if __name__ == "__main__":
 
 
     # --------------------------------------------------------
-    # Start 6-hour snapshotter.
+    # Start 6-hour incremental backup worker.
     # --------------------------------------------------------
 
     threading.Thread(
-        target=b2_snapshotter,
+        target=b2_backup_worker,
         daemon=True,
-        name="b2-snapshotter"
+        name="b2-backup-worker"
     ).start()
 
 
@@ -2769,7 +2579,7 @@ if __name__ == "__main__":
     )
 
     print(
-        "6-hour snapshotter started."
+        "6-hour incremental backup worker started."
     )
 
     print(
