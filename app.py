@@ -35,15 +35,26 @@ b2_bucket = b2_api.get_bucket_by_name(B2_BUCKET_NAME)
 
 
 # ============================================================
-# HISTORY CONFIGURATION
+# MAIN HISTORY FILE
 # ============================================================
 
 B2_HISTORY_FILENAME = "price_history.bin"
 
 B2_UPLOAD_INTERVAL = 30 * 60
 
-B2_BACKUP_PREFIX = "backups/price_history_"
+
+# ============================================================
+# NEW INCREMENTAL BACKUP FOLDER
+#
+# IMPORTANT:
+# This is deliberately different from the previous "backups/"
+# folder. Existing backups/ and snapshots/ files are untouched.
+# ============================================================
+
+B2_BACKUP_PREFIX = "backups_v2/price_history_"
+
 B2_BACKUP_INTERVAL = 6 * 60 * 60
+
 B2_BACKUP_MAX_SEGMENT_SECONDS = 6 * 60 * 60
 
 
@@ -64,7 +75,9 @@ def handle_error(error):
 API_URL = "https://api.donut.auction/v2/tickers/"
 
 SAMPLE_INTERVAL = 1
+
 CALIBRATION_INTERVAL = 1800
+
 PRICE_DIVISOR = 100_000
 
 
@@ -122,6 +135,7 @@ HEADERS = {
 
 compressed_data = bytearray()
 
+# Sorted by timestamp: [(timestamp, byte_offset), ...]
 calibration_index = []
 
 current_price = None
@@ -200,6 +214,10 @@ def write_calibration(timestamp, price):
 
 # ============================================================
 # ADD PRICE
+#
+# Reject timestamps that are equal to or older than the latest
+# stored timestamp. This protects the main history from new
+# duplicate or out-of-order samples.
 # ============================================================
 
 def add_price(timestamp, real_price):
@@ -213,7 +231,19 @@ def add_price(timestamp, real_price):
         raise ValueError("Price cannot be negative")
 
     with data_lock:
+
+        if (
+            current_timestamp is not None
+            and timestamp <= current_timestamp
+        ):
+            print(
+                "Skipping duplicate or out-of-order timestamp: "
+                f"{timestamp} <= {current_timestamp}"
+            )
+            return False
+
         if current_price is None:
+
             write_calibration(timestamp, price)
             last_calibration = timestamp
 
@@ -221,14 +251,18 @@ def add_price(timestamp, real_price):
             timestamp - last_calibration >= CALIBRATION_INTERVAL
             or timestamp - current_timestamp > SAMPLE_INTERVAL * 1.5
         ):
+
             write_calibration(timestamp, price)
             last_calibration = timestamp
 
         else:
+
             write_delta(price - current_price)
 
         current_price = price
         current_timestamp = timestamp
+
+        return True
 
 
 # ============================================================
@@ -255,14 +289,17 @@ def rebuild_state_from_history():
     price = None
     latest_calibration = None
     records = 0
+
     data_length = len(compressed_data)
 
     while pos < data_length:
+
         record_offset = pos
         record = compressed_data[pos]
         pos += 1
 
         if record == ord("C"):
+
             if pos + 16 > data_length:
                 raise ValueError("Incomplete calibration record")
 
@@ -278,6 +315,7 @@ def rebuild_state_from_history():
             records += 1
 
         elif record == ord("D"):
+
             if timestamp is None or price is None:
                 raise ValueError("Delta before calibration")
 
@@ -324,6 +362,7 @@ def load_current_history_from_b2():
     temp_filename = "/tmp/price_history.bin"
 
     try:
+
         downloaded = b2_bucket.download_file_by_name(
             B2_HISTORY_FILENAME
         )
@@ -337,9 +376,22 @@ def load_current_history_from_b2():
             raise ValueError("B2 history file is empty.")
 
         with data_lock:
-            compressed_data.clear()
-            compressed_data.extend(data)
-            rebuild_state_from_history()
+
+            old_data = bytes(compressed_data)
+
+            try:
+                compressed_data.clear()
+                compressed_data.extend(data)
+                rebuild_state_from_history()
+
+            except Exception:
+                compressed_data.clear()
+                compressed_data.extend(old_data)
+
+                if old_data:
+                    rebuild_state_from_history()
+
+                raise
 
         print(
             f"B2 history loaded successfully: "
@@ -349,10 +401,12 @@ def load_current_history_from_b2():
         return True
 
     except Exception as e:
+
         print(
             f"Current B2 history could not be loaded: "
             f"{type(e).__name__}: {e}"
         )
+
         return False
 
 
@@ -374,6 +428,7 @@ def create_new_history():
     initial_data.extend(struct.pack("<dQ", timestamp, price))
 
     with data_lock:
+
         compressed_data.clear()
         compressed_data.extend(initial_data)
 
@@ -387,6 +442,7 @@ def create_new_history():
     print("Created new local history.")
 
     try:
+
         b2_bucket.upload_bytes(
             bytes(initial_data),
             B2_HISTORY_FILENAME,
@@ -396,30 +452,30 @@ def create_new_history():
         print("Created new price_history.bin on B2.")
 
     except Exception as e:
+
         print(f"Warning: could not create initial B2 history: {e}")
 
 
 # ============================================================
-# DECODE COMPRESSED HISTORY INTO RECORDS
+# DECODE COMPRESSED HISTORY INTO TIMESTAMPED RECORDS
 # ============================================================
 
 def decode_compressed_records(data):
-    """
-    Decode the C/D binary format into (timestamp, price) records.
-    Prices remain in the compressed integer scale.
-    """
     records = []
 
     pos = 0
     timestamp = None
     price = None
+
     data_length = len(data)
 
     while pos < data_length:
+
         marker = data[pos]
         pos += 1
 
         if marker == ord("C"):
+
             if pos + 16 > data_length:
                 raise ValueError("Incomplete calibration record")
 
@@ -429,9 +485,11 @@ def decode_compressed_records(data):
             )
 
             pos += 16
+
             records.append((timestamp, price))
 
         elif marker == ord("D"):
+
             if timestamp is None or price is None:
                 raise ValueError("Delta before calibration")
 
@@ -452,90 +510,10 @@ def decode_compressed_records(data):
 
 
 # ============================================================
-# INCREMENTAL DECODER
-# ============================================================
-
-def decode_records_after(data, last_timestamp):
-    """
-    Decode only records newer than the checkpoint.
-
-    Start from the nearest calibration before the checkpoint instead
-    of decoding the entire history each time.
-    """
-    if last_timestamp is None:
-        return decode_compressed_records(data)
-
-    with data_lock:
-        index = list(calibration_index)
-
-    if not index:
-        return []
-
-    timestamps = [item[0] for item in index]
-
-    calibration_number = bisect.bisect_right(
-        timestamps,
-        last_timestamp
-    ) - 1
-
-    pos = (
-        index[calibration_number][1]
-        if calibration_number >= 0
-        else 0
-    )
-
-    records = []
-    timestamp = None
-    price = None
-    data_length = len(data)
-
-    while pos < data_length:
-        marker = data[pos]
-        pos += 1
-
-        if marker == ord("C"):
-            if pos + 16 > data_length:
-                raise ValueError("Incomplete calibration record")
-
-            timestamp, price = struct.unpack(
-                "<dQ",
-                data[pos:pos + 16]
-            )
-
-            pos += 16
-
-        elif marker == ord("D"):
-            if timestamp is None or price is None:
-                raise ValueError("Delta before calibration")
-
-            delta, pos = read_delta(data, pos)
-
-            price += delta
-            timestamp += SAMPLE_INTERVAL
-
-            if price < 0 or price > 0xFFFFFFFFFFFFFFFF:
-                raise ValueError(f"Invalid decoded price: {price}")
-
-        else:
-            raise ValueError(f"Unknown record marker: {marker}")
-
-        if timestamp > last_timestamp:
-            records.append((timestamp, price))
-
-    return records
-
-
-# ============================================================
-# ENCODE INDEPENDENT BACKUP SEGMENT
+# ENCODE AN INDEPENDENT BACKUP SEGMENT
 # ============================================================
 
 def encode_backup_segment(records):
-    """
-    Encode a self-contained segment.
-
-    Every segment starts with a calibration, allowing each segment
-    to be decoded without needing the preceding segment.
-    """
     if not records:
         return b""
 
@@ -543,23 +521,27 @@ def encode_backup_segment(records):
 
     previous_timestamp = None
     previous_price = None
-    last_calibration = None
+    last_calibration_time = None
 
     for timestamp, price in records:
+
         must_calibrate = (
             previous_timestamp is None
             or timestamp <= previous_timestamp
             or timestamp - previous_timestamp > SAMPLE_INTERVAL * 1.5
-            or last_calibration is None
-            or timestamp - last_calibration >= CALIBRATION_INTERVAL
+            or last_calibration_time is None
+            or timestamp - last_calibration_time >= CALIBRATION_INTERVAL
         )
 
         if must_calibrate:
+
             output.append(ord("C"))
             output.extend(struct.pack("<dQ", timestamp, price))
-            last_calibration = timestamp
+
+            last_calibration_time = timestamp
 
         else:
+
             output.append(ord("D"))
 
             delta = price - previous_price
@@ -578,56 +560,57 @@ def encode_backup_segment(records):
 
 
 # ============================================================
-# LIST INCREMENTAL BACKUP SEGMENTS
+# LIST ONLY THE NEW V2 BACKUP SEGMENTS
+#
+# This deliberately ignores the old backups/ and snapshots/
+# folders. It also ignores files that don't match our naming
+# convention.
 # ============================================================
 
 def get_backup_segments():
-    """
-    Return the latest uploaded version of each backup segment,
-    ordered by timestamp.
 
-    Filenames:
-      backups/price_history_<first_ms>_<last_ms>.bin
-    """
     segments = []
 
     try:
+
         for version, _folder in b2_bucket.ls(
-            "backups/",
+            "backups_v2/",
             latest_only=True,
             recursive=True
         ):
+
             name = version.file_name
 
             if (
-                version.action == "upload"
-                and name.startswith(B2_BACKUP_PREFIX)
-                and name.endswith(".bin")
+                version.action != "upload"
+                or not name.startswith(B2_BACKUP_PREFIX)
+                or not name.endswith(".bin")
             ):
-                match = re.search(
-                    r"_(\d+)_(\d+)\.bin$",
-                    name
-                )
+                continue
 
-                if match:
-                    first_ms = int(match.group(1))
-                    last_ms = int(match.group(2))
+            match = re.search(r"_(\d+)_(\d+)\.bin$", name)
 
-                    segments.append({
-                        "version": version,
-                        "name": name,
-                        "first_timestamp": first_ms / 1000.0,
-                        "last_timestamp": last_ms / 1000.0,
-                    })
+            if not match:
+                print(f"WARNING: unrecognized V2 backup filename: {name}")
+                continue
 
-                else:
-                    print(
-                        f"WARNING: unrecognized backup filename: {name}"
-                    )
+            first_ms = int(match.group(1))
+            last_ms = int(match.group(2))
+
+            segments.append({
+                "version": version,
+                "name": name,
+                "first_timestamp": first_ms / 1000.0,
+                "last_timestamp": last_ms / 1000.0,
+            })
 
     except Exception as e:
-        print(f"Could not list B2 incremental backups: {e}")
-        raise
+
+        # Do not pretend the archive is empty when B2 listing failed.
+        # The caller must know the archive state is unknown.
+        raise RuntimeError(
+            f"Could not list V2 incremental backups: {e}"
+        ) from e
 
     segments.sort(
         key=lambda item: (
@@ -641,18 +624,17 @@ def get_backup_segments():
 
 
 # ============================================================
-# ARCHIVE ONLY NEW HISTORY
+# UPLOAD NEW HISTORY AS NON-OVERLAPPING SEGMENTS
+#
+# On the first run, the existing main history is migrated into
+# independent <=6-hour segments in backups_v2/.
+#
+# Subsequent runs only upload records newer than the latest
+# timestamp already archived in that folder.
 # ============================================================
 
 def archive_new_history_to_b2():
-    """
-    Upload only records newer than the latest successfully archived
-    timestamp.
 
-    If no backup segments exist, perform a one-time full migration.
-    If an upload fails, the next run discovers the last successful
-    segment and retries the remaining history.
-    """
     with data_lock:
         data = bytes(compressed_data)
 
@@ -660,49 +642,70 @@ def archive_new_history_to_b2():
         print("Incremental backup skipped: history is empty.")
         return
 
+    records = decode_compressed_records(data)
+
+    if not records:
+        print("Incremental backup skipped: no decoded records.")
+        return
+
     segments = get_backup_segments()
 
+    # Do not archive into an unknown state if an existing segment
+    # has an invalid timestamp or if segment ranges overlap.
+    segments.sort(
+        key=lambda item: (
+            item["first_timestamp"],
+            item["last_timestamp"],
+            item["name"]
+        )
+    )
+
+    for i in range(1, len(segments)):
+
+        previous = segments[i - 1]
+        current = segments[i]
+
+        if current["first_timestamp"] <= previous["last_timestamp"]:
+
+            # Exact duplicate filenames/ranges should not normally
+            # occur. Stop rather than silently advancing a checkpoint
+            # across potentially conflicting segment contents.
+            if current["name"] != previous["name"]:
+                raise ValueError(
+                    "Overlapping V2 backup segments detected: "
+                    f"{previous['name']} and {current['name']}. "
+                    "No new backup was uploaded."
+                )
+
     last_archived_timestamp = (
-        max(segment["last_timestamp"] for segment in segments)
+        max(s["last_timestamp"] for s in segments)
         if segments else None
     )
 
-    if last_archived_timestamp is None:
-        print(
-            "No backup segments found. "
-            "Archiving the existing history."
-        )
+    if last_archived_timestamp is not None:
 
-        new_records = decode_records_after(data, None)
+        new_records = [
+            record for record in records
+            if record[0] > last_archived_timestamp
+        ]
 
     else:
-        print(
-            "Incremental checkpoint: "
-            + time.strftime(
-                "%Y-%m-%d %H:%M:%S",
-                time.localtime(last_archived_timestamp)
-            )
-        )
 
-        new_records = decode_records_after(
-            data,
-            last_archived_timestamp
-        )
+        # One-time migration into the new folder.
+        # Old backup folders are not consulted.
+        new_records = records
 
     if not new_records:
         print("Incremental backup: no new records to archive.")
         return
 
-    print(
-        f"Archiving {len(new_records):,} new records."
-    )
-
-    # Split using elapsed timestamps, not record counts.
+    # Split using actual timestamps, not a fixed record count.
     chunks = []
     chunk = []
     chunk_start = None
 
     for record in new_records:
+
         timestamp = record[0]
 
         if (
@@ -710,7 +713,9 @@ def archive_new_history_to_b2():
             and chunk_start is not None
             and timestamp - chunk_start >= B2_BACKUP_MAX_SEGMENT_SECONDS
         ):
+
             chunks.append(chunk)
+
             chunk = []
             chunk_start = None
 
@@ -722,11 +727,12 @@ def archive_new_history_to_b2():
     if chunk:
         chunks.append(chunk)
 
-    existing_names = {
-        segment["name"] for segment in segments
-    }
+    # Recheck the existing filenames before uploads. Upload chunks
+    # chronologically so a failed later upload can safely catch up.
+    existing_names = {s["name"] for s in get_backup_segments()}
 
     for chunk_records in chunks:
+
         segment_data = encode_backup_segment(chunk_records)
 
         first_timestamp = chunk_records[0][0]
@@ -740,10 +746,64 @@ def archive_new_history_to_b2():
         )
 
         if segment_name in existing_names:
-            print(
-                f"Segment already exists; skipping: {segment_name}"
+
+            # Do not assume a matching name proves the segment is
+            # valid or identical. Validate the existing object.
+            existing = next(
+                (
+                    s for s in get_backup_segments()
+                    if s["name"] == segment_name
+                ),
+                None
             )
-            continue
+
+            if existing is not None:
+
+                downloaded = b2_bucket.download_file_by_id(
+                    existing["version"].id_
+                )
+
+                temp_filename = (
+                    "/tmp/price_history_existing_v2_segment.bin"
+                )
+
+                downloaded.save_to(temp_filename)
+
+                with open(temp_filename, "rb") as f:
+                    existing_data = f.read()
+
+                # Validate existing data before considering it complete.
+                existing_records = decode_compressed_records(existing_data)
+
+                if not existing_records:
+                    raise ValueError(
+                        f"Existing backup segment is empty: {segment_name}"
+                    )
+
+                if (
+                    existing_records[0][0] != first_timestamp
+                    or existing_records[-1][0] != last_timestamp
+                ):
+                    raise ValueError(
+                        "Existing backup filename does not match "
+                        f"its contents: {segment_name}"
+                    )
+
+                if existing_data != segment_data:
+                    raise ValueError(
+                        "Existing backup segment differs from the "
+                        "expected data. Refusing to overwrite: "
+                        f"{segment_name}"
+                    )
+
+                print(
+                    "Verified existing backup segment; skipping: "
+                    f"{segment_name}"
+                )
+
+                continue
+
+        started = time.time()
 
         print(
             f"Uploading incremental backup: {segment_name} "
@@ -751,46 +811,64 @@ def archive_new_history_to_b2():
             f"{len(segment_data) / 1024 / 1024:.2f} MB)"
         )
 
-        # Do not advance the checkpoint before upload succeeds.
         b2_bucket.upload_bytes(
             segment_data,
             segment_name,
             content_type="application/octet-stream"
         )
 
-        existing_names.add(segment_name)
+        # Verify that the segment is present and decodable after upload.
+        uploaded_segments = get_backup_segments()
 
-        print(f"Incremental backup uploaded: {segment_name}")
+        uploaded_segment = next(
+            (
+                s for s in uploaded_segments
+                if s["name"] == segment_name
+            ),
+            None
+        )
+
+        if uploaded_segment is None:
+            raise RuntimeError(
+                f"Uploaded segment could not be found in B2: {segment_name}"
+            )
+
+        print(
+            f"Incremental backup uploaded: {segment_name} "
+            f"in {time.time() - started:.1f}s"
+        )
+
+        existing_names.add(segment_name)
 
 
 # ============================================================
-# RECOVER FULL HISTORY FROM INCREMENTAL BACKUPS
+# RECOVER FULL HISTORY FROM V2 INCREMENTAL BACKUPS
 # ============================================================
 
 def load_incremental_backups_from_b2():
-    """
-    Download all backup segments in chronological order.
-    Each segment begins with a calibration record.
-    """
+
     global compressed_data
 
     segments = get_backup_segments()
 
     if not segments:
-        print("No incremental backup segments found.")
+        print("No V2 incremental backup segments found.")
         return False
 
     combined = bytearray()
     loaded = 0
+    previous_last_timestamp = None
 
     for segment in segments:
+
         print(f"Downloading backup segment: {segment['name']}")
 
         downloaded = b2_bucket.download_file_by_id(
             segment["version"].id_
         )
 
-        temp_filename = "/tmp/price_history_backup_segment.bin"
+        temp_filename = "/tmp/price_history_v2_segment.bin"
+
         downloaded.save_to(temp_filename)
 
         with open(temp_filename, "rb") as f:
@@ -808,29 +886,49 @@ def load_incremental_backups_from_b2():
                 f"Backup segment has no records: {segment['name']}"
             )
 
-        # Ensure the segment contents agree with its filename.
-        actual_first = decoded[0][0]
-        actual_last = decoded[-1][0]
-
         if (
-            abs(actual_first - segment["first_timestamp"]) > 0.001
-            or abs(actual_last - segment["last_timestamp"]) > 0.001
+            decoded[0][0] != segment["first_timestamp"]
+            or decoded[-1][0] != segment["last_timestamp"]
         ):
             raise ValueError(
-                f"Backup segment timestamp mismatch: {segment['name']}"
+                "Backup segment timestamps do not match its filename: "
+                f"{segment['name']}"
             )
+
+        if previous_last_timestamp is not None:
+
+            if decoded[0][0] <= previous_last_timestamp:
+                raise ValueError(
+                    "Overlapping or out-of-order backup segments found: "
+                    f"{segment['name']}"
+                )
+
+        previous_last_timestamp = decoded[-1][0]
 
         combined.extend(segment_data)
         loaded += len(decoded)
 
     with data_lock:
-        compressed_data.clear()
-        compressed_data.extend(combined)
-        rebuild_state_from_history()
+
+        old_data = bytes(compressed_data)
+
+        try:
+            compressed_data.clear()
+            compressed_data.extend(combined)
+            rebuild_state_from_history()
+
+        except Exception:
+            compressed_data.clear()
+            compressed_data.extend(old_data)
+
+            if old_data:
+                rebuild_state_from_history()
+
+            raise
 
     print(
         f"Recovered {loaded:,} records from "
-        f"{len(segments)} incremental backup segment(s)."
+        f"{len(segments)} V2 incremental backup segment(s)."
     )
 
     return True
@@ -841,6 +939,7 @@ def load_incremental_backups_from_b2():
 # ============================================================
 
 def upload_history_to_b2():
+
     with data_lock:
         data = bytes(compressed_data)
 
@@ -861,26 +960,24 @@ def upload_history_to_b2():
         content_type="application/octet-stream"
     )
 
-    elapsed = time.time() - started
-
     print(
         f"B2 main-history upload complete: "
         f"{len(data) / 1024 / 1024:.2f} MB "
-        f"in {elapsed:.1f}s"
+        f"in {time.time() - started:.1f}s"
     )
 
 
 # ============================================================
-# CLEAN UP OLD MAIN HISTORY VERSIONS
+# CLEAN UP OLD MAIN-HISTORY VERSIONS ONLY
+#
+# This function only deletes older uploaded versions whose exact
+# filename is price_history.bin. It never targets backup folders.
 # ============================================================
 
 def cleanup_old_history_versions():
-    """
-    Keep only the latest main-history version.
 
-    Incremental backup segments are never deleted.
-    """
     try:
+
         versions = []
 
         for version, _folder in b2_bucket.ls(
@@ -888,29 +985,61 @@ def cleanup_old_history_versions():
             latest_only=False,
             recursive=True
         ):
-            if version.file_name == B2_HISTORY_FILENAME:
+
+            if (
+                version.file_name == B2_HISTORY_FILENAME
+                and version.action == "upload"
+            ):
                 versions.append(version)
+
+        if len(versions) <= 1:
+            print("Main-history cleanup: nothing to delete.")
+            return
 
         versions.sort(
             key=lambda version: version.upload_timestamp,
             reverse=True
         )
 
-        # Keep the newest version and delete older versions.
-        for version in versions[1:]:
-            print(
-                f"Deleting old main-history version: "
-                f"{version.file_name}, ID={version.id_}"
-            )
+        newest = versions[0]
 
-            b2_bucket.delete_file_version(
-                version.id_,
-                version.file_name
-            )
+        print(
+            "Main-history cleanup: keeping newest version "
+            f"(file ID {newest.id_}); "
+            f"removing {len(versions) - 1} older version(s)."
+        )
+
+        # Keep the newest version. Delete only older versions of the
+        # exact main-history filename.
+        for old_version in versions[1:]:
+
+            if old_version.file_name != B2_HISTORY_FILENAME:
+                continue
+
+            try:
+
+                b2_api.delete_file_version(
+                    old_version.id_,
+                    old_version.file_name
+                )
+
+                print(
+                    "Deleted old main-history version: "
+                    f"{old_version.id_}"
+                )
+
+            except Exception as e:
+
+                print(
+                    "Could not delete old main-history version "
+                    f"{old_version.id_}: {e}"
+                )
 
     except Exception as e:
+
         print(
-            f"Warning: main-history version cleanup failed: {e}"
+            "Main-history cleanup failed; no other files are "
+            f"intentionally targeted: {type(e).__name__}: {e}"
         )
 
 
@@ -919,27 +1048,33 @@ def cleanup_old_history_versions():
 # ============================================================
 
 def load_history_with_recovery():
+
     print("================================================")
     print("Loading history...")
     print("================================================")
 
     if load_current_history_from_b2():
+
         print("Main history is healthy.")
         return
 
     print("Main history is unavailable or corrupt.")
-    print("Attempting recovery from incremental backup segments...")
+    print("Attempting recovery from V2 incremental backups...")
 
     if load_incremental_backups_from_b2():
+
         print("================================================")
-        print("RECOVERY FROM INCREMENTAL BACKUPS SUCCESSFUL")
+        print("RECOVERY FROM V2 INCREMENTAL BACKUPS SUCCESSFUL")
         print("================================================")
 
         try:
+
             upload_history_to_b2()
+
             print("Recovered history uploaded as the new main history.")
 
         except Exception as e:
+
             print(
                 "WARNING: recovered history could not be uploaded "
                 f"as main history: {e}"
@@ -947,9 +1082,8 @@ def load_history_with_recovery():
 
         return
 
-    print("No usable main history or incremental backups found.")
+    print("No usable main history or V2 backups found.")
     print("Starting a new history.")
-
     create_new_history()
 
 
@@ -958,6 +1092,7 @@ def load_history_with_recovery():
 # ============================================================
 
 def find_start_offset(start_time):
+
     if not calibration_index:
         return 0
 
@@ -975,11 +1110,13 @@ def find_start_offset(start_time):
 
 
 # ============================================================
-# DECODE HISTORY FOR GRAPH
+# DECODE HISTORY
 # ============================================================
 
 def decode_history(start_time=None, granularity=1):
+
     with data_lock:
+
         if not compressed_data:
             return []
 
@@ -987,9 +1124,11 @@ def decode_history(start_time=None, granularity=1):
         index = list(calibration_index)
 
     if start_time is None:
+
         pos = 0
 
     elif index:
+
         timestamps = [item[0] for item in index]
 
         calibration_number = (
@@ -1011,10 +1150,11 @@ def decode_history(start_time=None, granularity=1):
     results = []
 
     def finish_bucket():
+
         if not bucket:
             return
 
-        values = [item["price"] for item in bucket]
+        values = [x["price"] for x in bucket]
 
         results.append({
             "time": bucket[-1]["time"],
@@ -1029,10 +1169,12 @@ def decode_history(start_time=None, granularity=1):
     data_length = len(data)
 
     while pos < data_length:
+
         record = data[pos]
         pos += 1
 
         if record == ord("C"):
+
             if pos + 16 > data_length:
                 raise ValueError("Incomplete calibration record")
 
@@ -1044,6 +1186,7 @@ def decode_history(start_time=None, granularity=1):
             pos += 16
 
         elif record == ord("D"):
+
             if timestamp is None or price is None:
                 raise ValueError("Delta before calibration")
 
@@ -1085,6 +1228,7 @@ def decode_history(start_time=None, granularity=1):
 # ============================================================
 
 def get_elytra_price():
+
     print("DEBUG: requesting Donut API...")
 
     response = requests.get(
@@ -1102,6 +1246,7 @@ def get_elytra_price():
     print(f"DEBUG: API returned {len(data)} items")
 
     for item in data:
+
         print(
             f"DEBUG: item={item.get('itemName')} "
             f"price={item.get('unitPrice')} "
@@ -1125,23 +1270,32 @@ def get_elytra_price():
 # ============================================================
 
 def collector():
+
     while True:
+
         started = time.time()
 
         try:
+
             price = get_elytra_price()
 
-            add_price(time.time(), price)
+            accepted = add_price(
+                time.time(),
+                price
+            )
 
             with data_lock:
                 size = len(compressed_data)
 
-            print(
-                f"Elytra: {price:,} | "
-                f"History: {size / 1024 / 1024:.2f} MB"
-            )
+            if accepted:
+
+                print(
+                    f"Elytra: {price:,} | "
+                    f"History: {size / 1024 / 1024:.2f} MB"
+                )
 
         except Exception as e:
+
             print(
                 f"Error collecting price: "
                 f"{type(e).__name__}: {e}"
@@ -1149,27 +1303,29 @@ def collector():
 
         elapsed = time.time() - started
 
-        sleep_time = max(
-            0,
-            SAMPLE_INTERVAL - elapsed
-        )
+        sleep_time = max(0, SAMPLE_INTERVAL - elapsed)
 
         time.sleep(sleep_time)
 
 
 # ============================================================
-# MAIN HISTORY UPLOADER
+# B2 MAIN HISTORY UPLOADER
 # ============================================================
 
 def b2_uploader():
+
     while True:
+
         time.sleep(B2_UPLOAD_INTERVAL)
 
         try:
+
             upload_history_to_b2()
+
             cleanup_old_history_versions()
 
         except Exception as e:
+
             print(
                 f"B2 upload failed: "
                 f"{type(e).__name__}: {e}"
@@ -1177,43 +1333,30 @@ def b2_uploader():
 
 
 # ============================================================
-# SIX-HOUR INCREMENTAL BACKUP WORKER
+# B2 SIX-HOUR INCREMENTAL BACKUP WORKER
+#
+# Runs immediately at startup, then attempts a backup every
+# six hours. If a run fails, the next run retries from the
+# latest segment successfully present in backups_v2/.
 # ============================================================
 
 def b2_backup_worker():
-    """
-    Run immediately on startup, then every six hours.
-
-    If a backup fails, retry in 60 seconds. The last successful
-    segment remains the checkpoint, so missing data is retried.
-    """
-    next_backup = time.monotonic()
 
     while True:
-        delay = next_backup - time.monotonic()
-
-        if delay > 0:
-            time.sleep(delay)
 
         try:
+
             archive_new_history_to_b2()
 
-            # Advance the schedule only after successful completion.
-            next_backup += B2_BACKUP_INTERVAL
-
-            # If we fell behind, catch up immediately.
-            if next_backup <= time.monotonic():
-                next_backup = time.monotonic()
-
         except Exception as e:
+
             print(
-                f"Incremental backup failed; retrying in 60 seconds: "
+                "Incremental backup failed; source history is "
+                "retained for retry: "
                 f"{type(e).__name__}: {e}"
             )
 
-            time.sleep(60)
-
-            # Retry without advancing the successful backup schedule.
+        time.sleep(B2_BACKUP_INTERVAL)
 
 
 # ============================================================
@@ -1222,13 +1365,12 @@ def b2_backup_worker():
 
 @app.route("/")
 def home():
+
     return render_template_string("""
 <!DOCTYPE html>
 <html>
-
 <head>
 <title>Donut Elytra Price</title>
-
 <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
 
 <style>
@@ -1240,18 +1382,13 @@ body{
     margin:40px auto;
     padding:20px
 }
-
-h1{
-    text-align:center
-}
-
+h1{text-align:center}
 #price{
     text-align:center;
     font-size:40px;
     font-weight:bold;
     margin:20px
 }
-
 .controls{
     display:flex;
     flex-wrap:wrap;
@@ -1259,25 +1396,19 @@ h1{
     justify-content:center;
     margin:20px 0
 }
-
-.control{
-    text-align:center
-}
-
+.control{text-align:center}
 .control label{
     display:block;
     margin-bottom:8px;
     color:#aaa;
     font-size:14px
 }
-
 .buttons{
     display:flex;
     gap:5px;
     flex-wrap:wrap;
     justify-content:center
 }
-
 button{
     background:#222;
     color:white;
@@ -1286,16 +1417,11 @@ button{
     padding:8px 12px;
     cursor:pointer
 }
-
-button:hover{
-    background:#333
-}
-
+button:hover{background:#333}
 button.active{
     background:#00a866;
     border-color:#00ff88
 }
-
 #stats{
     background:#181818;
     border-radius:10px;
@@ -1307,11 +1433,7 @@ button.active{
     gap:25px;
     color:#ccc
 }
-
-.stat strong{
-    color:white
-}
-
+.stat strong{color:white}
 canvas{
     background:#181818;
     border-radius:12px;
@@ -1367,21 +1489,11 @@ canvas{
 </div>
 
 <div id="stats">
-<div class="stat">
-Time: <strong id="hoverTime">Move over graph</strong>
-</div>
-<div class="stat">
-Price: <strong id="hoverPrice">—</strong>
-</div>
-<div class="stat">
-Min: <strong id="statMin">—</strong>
-</div>
-<div class="stat">
-Max: <strong id="statMax">—</strong>
-</div>
-<div class="stat">
-Median: <strong id="statMedian">—</strong>
-</div>
+<div class="stat">Time: <strong id="hoverTime">Move over graph</strong></div>
+<div class="stat">Price: <strong id="hoverPrice">—</strong></div>
+<div class="stat">Min: <strong id="statMin">—</strong></div>
+<div class="stat">Max: <strong id="statMax">—</strong></div>
+<div class="stat">Median: <strong id="statMedian">—</strong></div>
 </div>
 
 <canvas id="chart"></canvas>
@@ -1416,7 +1528,6 @@ function smoothData(data, level){
     return data.map((point, i) => {
         const start = Math.max(0, i - radius);
         const end = Math.min(data.length - 1, i + radius);
-
         let total = 0;
 
         for(let j = start; j <= end; j++){
@@ -1429,7 +1540,6 @@ function smoothData(data, level){
 
 const chart = new Chart(ctx, {
     type:"line",
-
     data:{
         labels:[],
         datasets:[{
@@ -1443,22 +1553,16 @@ const chart = new Chart(ctx, {
             fill:true
         }]
     },
-
     options:{
         responsive:true,
         animation:false,
-
         interaction:{
             mode:"index",
             intersect:false
         },
-
         plugins:{
-            tooltip:{
-                enabled:false
-            }
+            tooltip:{enabled:false}
         },
-
         scales:{
             x:{
                 title:{
@@ -1466,13 +1570,11 @@ const chart = new Chart(ctx, {
                     text:"Time"
                 }
             },
-
             y:{
                 title:{
                     display:true,
                     text:"Price"
                 },
-
                 ticks:{
                     callback:value => Number(value).toLocaleString()
                 }
@@ -1482,26 +1584,30 @@ const chart = new Chart(ctx, {
 });
 
 function updateButtons(){
-    document.querySelectorAll("#rangeButtons button").forEach(button => {
-        button.classList.toggle(
-            "active",
-            button.dataset.range === selectedRange
-        );
-    });
 
-    document.querySelectorAll("#granularityButtons button").forEach(button => {
-        button.classList.toggle(
-            "active",
-            Number(button.dataset.granularity) === selectedGranularity
-        );
-    });
+    document.querySelectorAll("#rangeButtons button")
+        .forEach(button => {
+            button.classList.toggle(
+                "active",
+                button.dataset.range === selectedRange
+            );
+        });
 
-    document.querySelectorAll("#smoothnessButtons button").forEach(button => {
-        button.classList.toggle(
-            "active",
-            Number(button.dataset.smoothness) === selectedSmoothness
-        );
-    });
+    document.querySelectorAll("#granularityButtons button")
+        .forEach(button => {
+            button.classList.toggle(
+                "active",
+                Number(button.dataset.granularity) === selectedGranularity
+            );
+        });
+
+    document.querySelectorAll("#smoothnessButtons button")
+        .forEach(button => {
+            button.classList.toggle(
+                "active",
+                Number(button.dataset.smoothness) === selectedSmoothness
+            );
+        });
 }
 
 function showStats(point){
@@ -1524,6 +1630,7 @@ function showStats(point){
 }
 
 ctx.addEventListener("mousemove", event => {
+
     const elements = chart.getElementsAtEventForMode(
         event,
         "index",
@@ -1537,6 +1644,7 @@ ctx.addEventListener("mousemove", event => {
 });
 
 async function update(){
+
     if(updateInProgress){
         updateAgain = true;
         return;
@@ -1545,6 +1653,7 @@ async function update(){
     updateInProgress = true;
 
     try{
+
         const response = await fetch(
             "/history?range="
             + encodeURIComponent(selectedRange)
@@ -1563,26 +1672,29 @@ async function update(){
             x => new Date(x.time * 1000).toLocaleString()
         );
 
-        chart.data.datasets[0].data = smoothData(
-            chartHistory,
-            selectedSmoothness
-        );
+        chart.data.datasets[0].data =
+            smoothData(chartHistory, selectedSmoothness);
 
         chart.update();
 
         if(chartHistory.length){
+
             const latest = chartHistory[chartHistory.length - 1].price;
 
             document.getElementById("price").textContent =
                 Math.round(latest).toLocaleString() + " coins";
+
         }else{
+
             document.getElementById("price").textContent = "No fresh data";
         }
 
     }catch(error){
+
         console.error("History update failed:", error);
 
     }finally{
+
         updateInProgress = false;
 
         if(updateAgain){
@@ -1592,38 +1704,46 @@ async function update(){
     }
 }
 
-document.querySelectorAll("#rangeButtons button").forEach(button => {
-    button.addEventListener("click", () => {
-        selectedRange = button.dataset.range;
-        selectedGranularity = defaultGranularity[selectedRange];
+document.querySelectorAll("#rangeButtons button")
+    .forEach(button => {
 
-        updateButtons();
-        update();
+        button.addEventListener("click", () => {
+
+            selectedRange = button.dataset.range;
+
+            selectedGranularity = defaultGranularity[selectedRange];
+
+            updateButtons();
+            update();
+        });
     });
-});
 
-document.querySelectorAll("#granularityButtons button").forEach(button => {
-    button.addEventListener("click", () => {
-        selectedGranularity = Number(button.dataset.granularity);
+document.querySelectorAll("#granularityButtons button")
+    .forEach(button => {
 
-        updateButtons();
-        update();
+        button.addEventListener("click", () => {
+
+            selectedGranularity = Number(button.dataset.granularity);
+
+            updateButtons();
+            update();
+        });
     });
-});
 
-document.querySelectorAll("#smoothnessButtons button").forEach(button => {
-    button.addEventListener("click", () => {
-        selectedSmoothness = Number(button.dataset.smoothness);
+document.querySelectorAll("#smoothnessButtons button")
+    .forEach(button => {
 
-        chart.data.datasets[0].data = smoothData(
-            chartHistory,
-            selectedSmoothness
-        );
+        button.addEventListener("click", () => {
 
-        chart.update();
-        updateButtons();
+            selectedSmoothness = Number(button.dataset.smoothness);
+
+            chart.data.datasets[0].data =
+                smoothData(chartHistory, selectedSmoothness);
+
+            chart.update();
+            updateButtons();
+        });
     });
-});
 
 updateButtons();
 update();
@@ -1642,6 +1762,7 @@ setInterval(update, 5000);
 
 @app.route("/history")
 def history_endpoint():
+
     selected_range = request.args.get("range", "hour")
 
     if selected_range not in DEFAULT_GRANULARITY:
@@ -1667,7 +1788,8 @@ def history_endpoint():
     elapsed = time.time() - started
 
     print(
-        f"/history range={selected_range} "
+        f"/history "
+        f"range={selected_range} "
         f"granularity={granularity} "
         f"points={len(result):,} "
         f"time={elapsed:.3f}s"
@@ -1682,8 +1804,11 @@ def history_endpoint():
 
 @app.route("/stats")
 def stats():
+
     with data_lock:
+
         return jsonify({
+
             "compressed_bytes": len(compressed_data),
 
             "compressed_mb": round(
@@ -1704,6 +1829,7 @@ def stats():
             ),
 
             "current_timestamp": current_timestamp
+
         })
 
 
@@ -1712,14 +1838,19 @@ def stats():
 # ============================================================
 
 if __name__ == "__main__":
+
     print("================================================")
     print("Starting Donut Elytra price tracker...")
     print("================================================")
 
+    # Load existing main history first. If it is unavailable,
+    # recovery uses only the new backups_v2/ folder.
     load_history_with_recovery()
 
     print("History initialization complete.")
 
+    # Clean old versions of the exact main-history filename.
+    # This does not target backups_v2/, backups/, or snapshots/.
     cleanup_old_history_versions()
 
     threading.Thread(
@@ -1742,7 +1873,8 @@ if __name__ == "__main__":
 
     print("Collector started.")
     print("B2 uploader started.")
-    print("6-hour incremental backup worker started.")
+    print("Six-hour V2 backup worker started.")
+    print("New backup folder: backups_v2/")
     print("Web server starting...")
 
     app.run(
