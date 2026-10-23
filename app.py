@@ -31,38 +31,16 @@ b2_api.authorize_account(
     B2_APPLICATION_KEY
 )
 
-b2_bucket = b2_api.get_bucket_by_name(
-    B2_BUCKET_NAME
-)
+b2_bucket = b2_api.get_bucket_by_name(B2_BUCKET_NAME)
 
 
-# ------------------------------------------------------------
-# MAIN HISTORY FILE
-# ------------------------------------------------------------
+# ============================================================
+# HISTORY CONFIGURATION
+# ============================================================
 
 B2_HISTORY_FILENAME = "price_history.bin"
 
-
-# ------------------------------------------------------------
-# MAIN HISTORY UPLOAD
-#
-# The complete history is uploaded every 30 minutes.
-# We clean up old B2 versions so this does not create
-# hundreds of old versions.
-# ------------------------------------------------------------
-
 B2_UPLOAD_INTERVAL = 30 * 60
-
-
-# ------------------------------------------------------------
-# INCREMENTAL BACKUPS
-#
-# Each backup contains only new records since the previous
-# successful backup. Segments are independently decodable and
-# together reconstruct the complete compressed history.
-#
-# Backups are NEVER automatically deleted.
-# ------------------------------------------------------------
 
 B2_BACKUP_PREFIX = "backups/price_history_"
 B2_BACKUP_INTERVAL = 6 * 60 * 60
@@ -75,12 +53,8 @@ B2_BACKUP_MAX_SEGMENT_SECONDS = 6 * 60 * 60
 
 @app.errorhandler(Exception)
 def handle_error(error):
-
     app.logger.exception("Unhandled error")
-
-    return jsonify({
-        "error": str(error)
-    }), 500
+    return jsonify({"error": str(error)}), 500
 
 
 # ============================================================
@@ -90,9 +64,7 @@ def handle_error(error):
 API_URL = "https://api.donut.auction/v2/tickers/"
 
 SAMPLE_INTERVAL = 1
-
 CALIBRATION_INTERVAL = 1800
-
 PRICE_DIVISOR = 100_000
 
 
@@ -101,55 +73,26 @@ PRICE_DIVISOR = 100_000
 # ============================================================
 
 DEFAULT_GRANULARITY = {
-
     "minute": 1,
-
     "5minutes": 1,
-
     "hour": 60,
-
     "day": 300,
-
     "week": 3600,
-
     "month": 86400,
-
     "max": 86400
-
 }
-
 
 TIME_RANGES = {
-
     "minute": 60,
-
     "5minutes": 300,
-
     "hour": 3600,
-
     "day": 86400,
-
     "week": 604800,
-
     "month": 2592000
-
 }
 
-
 VALID_GRANULARITIES = {
-
-    1,
-
-    10,
-
-    60,
-
-    300,
-
-    3600,
-
-    86400
-
+    1, 10, 60, 300, 3600, 86400
 }
 
 
@@ -158,53 +101,32 @@ VALID_GRANULARITIES = {
 # ============================================================
 
 HEADERS = {
-
     "Accept": "*/*",
-
     "Accept-Language": "en-US,en;q=0.9",
-
     "Cache-Control": "no-cache",
-
     "Content-Type": "application/json",
-
     "Origin": "https://donut.auction",
-
     "Pragma": "no-cache",
-
     "Referer": "https://donut.auction/",
-
     "User-Agent": (
         "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
         "AppleWebKit/537.36 (KHTML, like Gecko) "
         "Chrome/151.0.0.0 Safari/537.36"
     )
-
 }
 
 
 # ============================================================
-# COMPRESSED HISTORY
+# COMPRESSED HISTORY STATE
 # ============================================================
 
 compressed_data = bytearray()
 
-
-# Sorted by timestamp:
-#
-# [
-#     (timestamp, byte_offset),
-#     ...
-# ]
-
 calibration_index = []
 
-
 current_price = None
-
 current_timestamp = None
-
 last_calibration = None
-
 
 data_lock = threading.RLock()
 
@@ -214,12 +136,10 @@ data_lock = threading.RLock()
 # ============================================================
 
 def compress_price(price):
-
     return int(price) // PRICE_DIVISOR
 
 
 def decompress_price(price):
-
     return price * PRICE_DIVISOR
 
 
@@ -228,62 +148,39 @@ def decompress_price(price):
 # ============================================================
 
 def write_delta(delta):
-
     compressed_data.append(ord("D"))
 
-    # ZigZag encoding.
     value = (delta << 1) ^ (delta >> 63)
 
     while value >= 128:
-
-        compressed_data.append(
-            (value & 127) | 128
-        )
-
+        compressed_data.append((value & 127) | 128)
         value >>= 7
 
     compressed_data.append(value)
 
 
 def read_delta(data, pos):
-
     value = 0
-
     shift = 0
 
     while True:
-
         if pos >= len(data):
-
-            raise ValueError(
-                "Incomplete delta"
-            )
+            raise ValueError("Incomplete delta")
 
         byte = data[pos]
-
         pos += 1
 
-        value |= (
-            (byte & 127)
-            << shift
-        )
+        value |= (byte & 127) << shift
 
         if not byte & 128:
-
             break
 
         shift += 7
 
         if shift > 63:
+            raise ValueError("Invalid/corrupt delta")
 
-            raise ValueError(
-                "Invalid/corrupt delta"
-            )
-
-    delta = (
-        (value >> 1)
-        ^ -(value & 1)
-    )
+    delta = (value >> 1) ^ -(value & 1)
 
     return delta, pos
 
@@ -293,25 +190,12 @@ def read_delta(data, pos):
 # ============================================================
 
 def write_calibration(timestamp, price):
-
     offset = len(compressed_data)
 
     compressed_data.extend(b"C")
+    compressed_data.extend(struct.pack("<dQ", timestamp, price))
 
-    compressed_data.extend(
-        struct.pack(
-            "<dQ",
-            timestamp,
-            price
-        )
-    )
-
-    calibration_index.append(
-        (
-            timestamp,
-            offset
-        )
-    )
+    calibration_index.append((timestamp, offset))
 
 
 # ============================================================
@@ -319,7 +203,6 @@ def write_calibration(timestamp, price):
 # ============================================================
 
 def add_price(timestamp, real_price):
-
     global current_price
     global current_timestamp
     global last_calibration
@@ -327,47 +210,24 @@ def add_price(timestamp, real_price):
     price = compress_price(real_price)
 
     if price < 0:
-
-        raise ValueError(
-            "Price cannot be negative"
-        )
+        raise ValueError("Price cannot be negative")
 
     with data_lock:
-
         if current_price is None:
-
-            write_calibration(
-                timestamp,
-                price
-            )
-
+            write_calibration(timestamp, price)
             last_calibration = timestamp
 
         elif (
-            timestamp - last_calibration
-            >= CALIBRATION_INTERVAL
-
-            or
-
-            timestamp - current_timestamp
-            > SAMPLE_INTERVAL * 1.5
+            timestamp - last_calibration >= CALIBRATION_INTERVAL
+            or timestamp - current_timestamp > SAMPLE_INTERVAL * 1.5
         ):
-
-            write_calibration(
-                timestamp,
-                price
-            )
-
+            write_calibration(timestamp, price)
             last_calibration = timestamp
 
         else:
-
-            write_delta(
-                price - current_price
-            )
+            write_delta(price - current_price)
 
         current_price = price
-
         current_timestamp = timestamp
 
 
@@ -376,7 +236,6 @@ def add_price(timestamp, real_price):
 # ============================================================
 
 def rebuild_state_from_history():
-
     global current_price
     global current_timestamp
     global last_calibration
@@ -384,134 +243,63 @@ def rebuild_state_from_history():
     calibration_index.clear()
 
     if not compressed_data:
-
         current_price = None
-
         current_timestamp = None
-
         last_calibration = None
+        raise ValueError("History is empty.")
 
-        raise ValueError(
-            "History is empty."
-        )
-
-    print(
-        "Scanning history and rebuilding index..."
-    )
+    print("Scanning history and rebuilding index...")
 
     pos = 0
-
     timestamp = None
-
     price = None
-
     latest_calibration = None
-
     records = 0
-
     data_length = len(compressed_data)
 
     while pos < data_length:
-
         record_offset = pos
-
         record = compressed_data[pos]
-
         pos += 1
 
-
-        # ----------------------------------------------------
-        # CALIBRATION
-        # ----------------------------------------------------
-
         if record == ord("C"):
-
             if pos + 16 > data_length:
-
-                raise ValueError(
-                    "Incomplete calibration record"
-                )
+                raise ValueError("Incomplete calibration record")
 
             timestamp, price = struct.unpack(
                 "<dQ",
-                compressed_data[
-                    pos:pos + 16
-                ]
+                compressed_data[pos:pos + 16]
             )
 
             pos += 16
 
-            calibration_index.append(
-                (
-                    timestamp,
-                    record_offset
-                )
-            )
-
+            calibration_index.append((timestamp, record_offset))
             latest_calibration = timestamp
-
             records += 1
-
-
-        # ----------------------------------------------------
-        # DELTA
-        # ----------------------------------------------------
 
         elif record == ord("D"):
+            if timestamp is None or price is None:
+                raise ValueError("Delta before calibration")
 
-            if (
-                timestamp is None
-                or price is None
-            ):
-
-                raise ValueError(
-                    "Delta before calibration"
-                )
-
-            delta, pos = read_delta(
-                compressed_data,
-                pos
-            )
+            delta, pos = read_delta(compressed_data, pos)
 
             price += delta
-
             timestamp += SAMPLE_INTERVAL
 
-            if (
-                price < 0
-                or price > 0xFFFFFFFFFFFFFFFF
-            ):
-
-                raise ValueError(
-                    f"Invalid decoded price: {price}"
-                )
+            if price < 0 or price > 0xFFFFFFFFFFFFFFFF:
+                raise ValueError(f"Invalid decoded price: {price}")
 
             records += 1
 
-
         else:
+            raise ValueError(f"Unknown record marker: {record}")
 
-            raise ValueError(
-                f"Unknown record marker: {record}"
-            )
-
-
-    if (
-        timestamp is None
-        or price is None
-    ):
-
-        raise ValueError(
-            "History contains no usable data"
-        )
-
+    if timestamp is None or price is None:
+        raise ValueError("History contains no usable data")
 
     current_timestamp = timestamp
-
     current_price = price
-
     last_calibration = latest_calibration
-
 
     print(
         f"History restored: "
@@ -520,70 +308,38 @@ def rebuild_state_from_history():
         f"{len(calibration_index):,} calibrations"
     )
 
-    print(
-        f"Latest restored price: "
-        f"{decompress_price(current_price):,}"
-    )
-
-    print(
-        f"Latest restored timestamp: "
-        f"{current_timestamp}"
-    )
+    print(f"Latest restored price: {decompress_price(current_price):,}")
+    print(f"Latest restored timestamp: {current_timestamp}")
 
 
 # ============================================================
-# DOWNLOAD CURRENT MAIN HISTORY FROM B2
+# DOWNLOAD MAIN HISTORY FROM B2
 # ============================================================
 
 def load_current_history_from_b2():
-
     global compressed_data
-    global current_price
-    global current_timestamp
-    global last_calibration
 
-    print(
-        f"Checking B2 for {B2_HISTORY_FILENAME}..."
-    )
+    print(f"Checking B2 for {B2_HISTORY_FILENAME}...")
 
     temp_filename = "/tmp/price_history.bin"
 
     try:
-
         downloaded = b2_bucket.download_file_by_name(
             B2_HISTORY_FILENAME
         )
 
-        downloaded.save_to(
-            temp_filename
-        )
+        downloaded.save_to(temp_filename)
 
-        with open(
-            temp_filename,
-            "rb"
-        ) as f:
-
+        with open(temp_filename, "rb") as f:
             data = f.read()
 
-
         if not data:
-
-            raise ValueError(
-                "B2 history file is empty."
-            )
-
+            raise ValueError("B2 history file is empty.")
 
         with data_lock:
-
             compressed_data.clear()
-
-            compressed_data.extend(
-                data
-            )
-
-            # This validates the entire file.
+            compressed_data.extend(data)
             rebuild_state_from_history()
-
 
         print(
             f"B2 history loaded successfully: "
@@ -592,14 +348,11 @@ def load_current_history_from_b2():
 
         return True
 
-
     except Exception as e:
-
         print(
             f"Current B2 history could not be loaded: "
             f"{type(e).__name__}: {e}"
         )
-
         return False
 
 
@@ -608,88 +361,55 @@ def load_current_history_from_b2():
 # ============================================================
 
 def create_new_history():
-
     global compressed_data
     global current_price
     global current_timestamp
     global last_calibration
 
     timestamp = time.time()
-
     price = 0
 
     initial_data = bytearray()
-
     initial_data.extend(b"C")
-
-    initial_data.extend(
-        struct.pack(
-            "<dQ",
-            timestamp,
-            price
-        )
-    )
-
+    initial_data.extend(struct.pack("<dQ", timestamp, price))
 
     with data_lock:
-
         compressed_data.clear()
-
-        compressed_data.extend(
-            initial_data
-        )
+        compressed_data.extend(initial_data)
 
         calibration_index.clear()
-
-        calibration_index.append(
-            (
-                timestamp,
-                0
-            )
-        )
+        calibration_index.append((timestamp, 0))
 
         current_timestamp = timestamp
-
         current_price = price
-
         last_calibration = timestamp
 
-
-    print(
-        "Created new local history."
-    )
-
+    print("Created new local history.")
 
     try:
-
         b2_bucket.upload_bytes(
             bytes(initial_data),
             B2_HISTORY_FILENAME,
             content_type="application/octet-stream"
         )
 
-        print(
-            "Created new price_history.bin on B2."
-        )
+        print("Created new price_history.bin on B2.")
 
     except Exception as e:
-
-        print(
-            f"Warning: could not create initial B2 "
-            f"history: {e}"
-        )
+        print(f"Warning: could not create initial B2 history: {e}")
 
 
 # ============================================================
-# READ COMPRESSED HISTORY INTO TIMESTAMPED RECORDS
+# DECODE COMPRESSED HISTORY INTO RECORDS
 # ============================================================
 
 def decode_compressed_records(data):
     """
-    Decode the existing C/D binary format into (timestamp, price)
-    records. Prices are kept in the compressed integer scale.
+    Decode the C/D binary format into (timestamp, price) records.
+    Prices remain in the compressed integer scale.
     """
     records = []
+
     pos = 0
     timestamp = None
     price = None
@@ -702,18 +422,27 @@ def decode_compressed_records(data):
         if marker == ord("C"):
             if pos + 16 > data_length:
                 raise ValueError("Incomplete calibration record")
-            timestamp, price = struct.unpack("<dQ", data[pos:pos + 16])
+
+            timestamp, price = struct.unpack(
+                "<dQ",
+                data[pos:pos + 16]
+            )
+
             pos += 16
             records.append((timestamp, price))
 
         elif marker == ord("D"):
             if timestamp is None or price is None:
                 raise ValueError("Delta before calibration")
+
             delta, pos = read_delta(data, pos)
+
             price += delta
             timestamp += SAMPLE_INTERVAL
+
             if price < 0 or price > 0xFFFFFFFFFFFFFFFF:
                 raise ValueError(f"Invalid decoded price: {price}")
+
             records.append((timestamp, price))
 
         else:
@@ -723,19 +452,95 @@ def decode_compressed_records(data):
 
 
 # ============================================================
-# ENCODE AN INDEPENDENT BACKUP SEGMENT
+# INCREMENTAL DECODER
+# ============================================================
+
+def decode_records_after(data, last_timestamp):
+    """
+    Decode only records newer than the checkpoint.
+
+    Start from the nearest calibration before the checkpoint instead
+    of decoding the entire history each time.
+    """
+    if last_timestamp is None:
+        return decode_compressed_records(data)
+
+    with data_lock:
+        index = list(calibration_index)
+
+    if not index:
+        return []
+
+    timestamps = [item[0] for item in index]
+
+    calibration_number = bisect.bisect_right(
+        timestamps,
+        last_timestamp
+    ) - 1
+
+    pos = (
+        index[calibration_number][1]
+        if calibration_number >= 0
+        else 0
+    )
+
+    records = []
+    timestamp = None
+    price = None
+    data_length = len(data)
+
+    while pos < data_length:
+        marker = data[pos]
+        pos += 1
+
+        if marker == ord("C"):
+            if pos + 16 > data_length:
+                raise ValueError("Incomplete calibration record")
+
+            timestamp, price = struct.unpack(
+                "<dQ",
+                data[pos:pos + 16]
+            )
+
+            pos += 16
+
+        elif marker == ord("D"):
+            if timestamp is None or price is None:
+                raise ValueError("Delta before calibration")
+
+            delta, pos = read_delta(data, pos)
+
+            price += delta
+            timestamp += SAMPLE_INTERVAL
+
+            if price < 0 or price > 0xFFFFFFFFFFFFFFFF:
+                raise ValueError(f"Invalid decoded price: {price}")
+
+        else:
+            raise ValueError(f"Unknown record marker: {marker}")
+
+        if timestamp > last_timestamp:
+            records.append((timestamp, price))
+
+    return records
+
+
+# ============================================================
+# ENCODE INDEPENDENT BACKUP SEGMENT
 # ============================================================
 
 def encode_backup_segment(records):
     """
-    Encode records as a self-contained segment. The first sample
-    is always a calibration, so segments can be concatenated and
-    decoded independently of earlier segments.
+    Encode a self-contained segment.
+
+    Every segment starts with a calibration, allowing each segment
+    to be decoded without needing the preceding segment.
     """
     if not records:
         return b""
 
     output = bytearray()
+
     previous_timestamp = None
     previous_price = None
     last_calibration = None
@@ -753,13 +558,17 @@ def encode_backup_segment(records):
             output.append(ord("C"))
             output.extend(struct.pack("<dQ", timestamp, price))
             last_calibration = timestamp
+
         else:
             output.append(ord("D"))
+
             delta = price - previous_price
             value = (delta << 1) ^ (delta >> 63)
+
             while value >= 128:
                 output.append((value & 127) | 128)
                 value >>= 7
+
             output.append(value)
 
         previous_timestamp = timestamp
@@ -775,8 +584,9 @@ def encode_backup_segment(records):
 def get_backup_segments():
     """
     Return the latest uploaded version of each backup segment,
-    ordered by its first timestamp. Never deletes any versions.
-    Segment names contain millisecond timestamps:
+    ordered by timestamp.
+
+    Filenames:
       backups/price_history_<first_ms>_<last_ms>.bin
     """
     segments = []
@@ -788,47 +598,60 @@ def get_backup_segments():
             recursive=True
         ):
             name = version.file_name
+
             if (
                 version.action == "upload"
                 and name.startswith(B2_BACKUP_PREFIX)
                 and name.endswith(".bin")
             ):
-                match = re.search(r"_(\d+)_(\d+)\.bin$", name)
+                match = re.search(
+                    r"_(\d+)_(\d+)\.bin$",
+                    name
+                )
+
                 if match:
                     first_ms = int(match.group(1))
                     last_ms = int(match.group(2))
+
                     segments.append({
                         "version": version,
                         "name": name,
                         "first_timestamp": first_ms / 1000.0,
                         "last_timestamp": last_ms / 1000.0,
                     })
+
                 else:
-                    print(f"WARNING: unrecognized backup filename: {name}")
+                    print(
+                        f"WARNING: unrecognized backup filename: {name}"
+                    )
 
     except Exception as e:
         print(f"Could not list B2 incremental backups: {e}")
-        return []
+        raise
 
-    segments.sort(key=lambda item: (
-        item["first_timestamp"],
-        item["last_timestamp"],
-        item["name"]
-    ))
+    segments.sort(
+        key=lambda item: (
+            item["first_timestamp"],
+            item["last_timestamp"],
+            item["name"]
+        )
+    )
+
     return segments
 
 
 # ============================================================
-# UPLOAD NEW HISTORY AS NON-OVERLAPPING SEGMENTS
+# ARCHIVE ONLY NEW HISTORY
 # ============================================================
 
 def archive_new_history_to_b2():
     """
     Upload only records newer than the latest successfully archived
-    timestamp. If no segments exist, this performs a one-time
-    migration of the existing history into <=6-hour segments.
-    Failed uploads are not treated as archived; the next run retries
-    from the last segment that actually exists in B2.
+    timestamp.
+
+    If no backup segments exist, perform a one-time full migration.
+    If an upload fails, the next run discovers the last successful
+    segment and retries the remaining history.
     """
     with data_lock:
         data = bytes(compressed_data)
@@ -837,40 +660,51 @@ def archive_new_history_to_b2():
         print("Incremental backup skipped: history is empty.")
         return
 
-    records = decode_compressed_records(data)
-    if not records:
-        print("Incremental backup skipped: no decoded records.")
-        return
-
     segments = get_backup_segments()
+
     last_archived_timestamp = (
-        max(s["last_timestamp"] for s in segments)
+        max(segment["last_timestamp"] for segment in segments)
         if segments else None
     )
 
-    if last_archived_timestamp is not None:
-        new_records = [
-            record for record in records
-            if record[0] > last_archived_timestamp
-        ]
+    if last_archived_timestamp is None:
+        print(
+            "No backup segments found. "
+            "Archiving the existing history."
+        )
+
+        new_records = decode_records_after(data, None)
+
     else:
-        # One-time migration: preserve the existing history by
-        # splitting it into independent segments. This is not repeated
-        # once the segments exist.
-        new_records = records
+        print(
+            "Incremental checkpoint: "
+            + time.strftime(
+                "%Y-%m-%d %H:%M:%S",
+                time.localtime(last_archived_timestamp)
+            )
+        )
+
+        new_records = decode_records_after(
+            data,
+            last_archived_timestamp
+        )
 
     if not new_records:
         print("Incremental backup: no new records to archive.")
         return
 
-    # Split by elapsed timestamp span, not by assuming that samples
-    # arrive exactly on schedule. Actual missing samples remain gaps.
+    print(
+        f"Archiving {len(new_records):,} new records."
+    )
+
+    # Split using elapsed timestamps, not record counts.
     chunks = []
     chunk = []
     chunk_start = None
 
     for record in new_records:
         timestamp = record[0]
+
         if (
             chunk
             and chunk_start is not None
@@ -882,47 +716,51 @@ def archive_new_history_to_b2():
 
         if not chunk:
             chunk_start = timestamp
+
         chunk.append(record)
 
     if chunk:
         chunks.append(chunk)
 
+    existing_names = {
+        segment["name"] for segment in segments
+    }
+
     for chunk_records in chunks:
         segment_data = encode_backup_segment(chunk_records)
+
         first_timestamp = chunk_records[0][0]
         last_timestamp = chunk_records[-1][0]
+
         first_ms = int(round(first_timestamp * 1000))
         last_ms = int(round(last_timestamp * 1000))
+
         segment_name = (
             f"{B2_BACKUP_PREFIX}{first_ms}_{last_ms}.bin"
         )
 
-        # If the upload succeeded before a prior process interruption,
-        # the segment is already present and must not be uploaded again.
-        existing_names = {s["name"] for s in get_backup_segments()}
         if segment_name in existing_names:
-            print(f"Backup segment already exists; skipping: {segment_name}")
+            print(
+                f"Segment already exists; skipping: {segment_name}"
+            )
             continue
 
-        started = time.time()
         print(
             f"Uploading incremental backup: {segment_name} "
             f"({len(chunk_records):,} records, "
             f"{len(segment_data) / 1024 / 1024:.2f} MB)"
         )
 
-        # Do not delete or clear source/pending data. The source remains
-        # in compressed_data and is retried if this upload raises.
+        # Do not advance the checkpoint before upload succeeds.
         b2_bucket.upload_bytes(
             segment_data,
             segment_name,
             content_type="application/octet-stream"
         )
 
-        print(
-            f"Incremental backup uploaded: {segment_name} "
-            f"in {time.time() - started:.1f}s"
-        )
+        existing_names.add(segment_name)
+
+        print(f"Incremental backup uploaded: {segment_name}")
 
 
 # ============================================================
@@ -931,16 +769,13 @@ def archive_new_history_to_b2():
 
 def load_incremental_backups_from_b2():
     """
-    Download all available segments in chronological order and
-    concatenate them. Every segment begins with a calibration record,
-    so concatenation preserves the existing binary format.
+    Download all backup segments in chronological order.
+    Each segment begins with a calibration record.
     """
     global compressed_data
-    global current_price
-    global current_timestamp
-    global last_calibration
 
     segments = get_backup_segments()
+
     if not segments:
         print("No incremental backup segments found.")
         return False
@@ -950,9 +785,11 @@ def load_incremental_backups_from_b2():
 
     for segment in segments:
         print(f"Downloading backup segment: {segment['name']}")
+
         downloaded = b2_bucket.download_file_by_id(
             segment["version"].id_
         )
+
         temp_filename = "/tmp/price_history_backup_segment.bin"
         downloaded.save_to(temp_filename)
 
@@ -964,11 +801,23 @@ def load_incremental_backups_from_b2():
                 f"Backup segment is empty: {segment['name']}"
             )
 
-        # Validate each segment independently before combining it.
         decoded = decode_compressed_records(segment_data)
+
         if not decoded:
             raise ValueError(
                 f"Backup segment has no records: {segment['name']}"
+            )
+
+        # Ensure the segment contents agree with its filename.
+        actual_first = decoded[0][0]
+        actual_last = decoded[-1][0]
+
+        if (
+            abs(actual_first - segment["first_timestamp"]) > 0.001
+            or abs(actual_last - segment["last_timestamp"]) > 0.001
+        ):
+            raise ValueError(
+                f"Backup segment timestamp mismatch: {segment['name']}"
             )
 
         combined.extend(segment_data)
@@ -980,10 +829,89 @@ def load_incremental_backups_from_b2():
         rebuild_state_from_history()
 
     print(
-        f"Recovered {loaded:,} records from {len(segments)} "
-        f"incremental backup segment(s)."
+        f"Recovered {loaded:,} records from "
+        f"{len(segments)} incremental backup segment(s)."
     )
+
     return True
+
+
+# ============================================================
+# UPLOAD MAIN HISTORY TO B2
+# ============================================================
+
+def upload_history_to_b2():
+    with data_lock:
+        data = bytes(compressed_data)
+
+    if not data:
+        print("B2 upload skipped: no history yet.")
+        return
+
+    started = time.time()
+
+    print(
+        f"Starting B2 main-history upload: "
+        f"{len(data) / 1024 / 1024:.2f} MB"
+    )
+
+    b2_bucket.upload_bytes(
+        data,
+        B2_HISTORY_FILENAME,
+        content_type="application/octet-stream"
+    )
+
+    elapsed = time.time() - started
+
+    print(
+        f"B2 main-history upload complete: "
+        f"{len(data) / 1024 / 1024:.2f} MB "
+        f"in {elapsed:.1f}s"
+    )
+
+
+# ============================================================
+# CLEAN UP OLD MAIN HISTORY VERSIONS
+# ============================================================
+
+def cleanup_old_history_versions():
+    """
+    Keep only the latest main-history version.
+
+    Incremental backup segments are never deleted.
+    """
+    try:
+        versions = []
+
+        for version, _folder in b2_bucket.ls(
+            "",
+            latest_only=False,
+            recursive=True
+        ):
+            if version.file_name == B2_HISTORY_FILENAME:
+                versions.append(version)
+
+        versions.sort(
+            key=lambda version: version.upload_timestamp,
+            reverse=True
+        )
+
+        # Keep the newest version and delete older versions.
+        for version in versions[1:]:
+            print(
+                f"Deleting old main-history version: "
+                f"{version.file_name}, ID={version.id_}"
+            )
+
+            b2_bucket.delete_file_version(
+                version.id_,
+                version.file_name
+            )
+
+    except Exception as e:
+        print(
+            f"Warning: main-history version cleanup failed: {e}"
+        )
 
 
 # ============================================================
@@ -1010,15 +938,18 @@ def load_history_with_recovery():
         try:
             upload_history_to_b2()
             print("Recovered history uploaded as the new main history.")
+
         except Exception as e:
             print(
                 "WARNING: recovered history could not be uploaded "
                 f"as main history: {e}"
             )
+
         return
 
     print("No usable main history or incremental backups found.")
     print("Starting a new history.")
+
     create_new_history()
 
 
@@ -1027,336 +958,126 @@ def load_history_with_recovery():
 # ============================================================
 
 def find_start_offset(start_time):
-
     if not calibration_index:
-
         return 0
 
-
-    timestamps = [
-
-        item[0]
-
-        for item in calibration_index
-
-    ]
-
+    timestamps = [item[0] for item in calibration_index]
 
     index = bisect.bisect_right(
         timestamps,
         start_time
     ) - 1
 
-
     if index < 0:
-
         return 0
-
 
     return calibration_index[index][1]
 
 
 # ============================================================
-# DECODE HISTORY
+# DECODE HISTORY FOR GRAPH
 # ============================================================
 
-def decode_history(
-    start_time=None,
-    granularity=1
-):
-
+def decode_history(start_time=None, granularity=1):
     with data_lock:
-
         if not compressed_data:
-
             return []
 
-
-        data = bytes(
-            compressed_data
-        )
-
-
-        index = list(
-            calibration_index
-        )
-
-
-    # --------------------------------------------------------
-    # Find closest calibration.
-    # --------------------------------------------------------
+        data = bytes(compressed_data)
+        index = list(calibration_index)
 
     if start_time is None:
-
         pos = 0
 
     elif index:
-
-        timestamps = [
-
-            item[0]
-
-            for item in index
-
-        ]
-
+        timestamps = [item[0] for item in index]
 
         calibration_number = (
-
-            bisect.bisect_right(
-                timestamps,
-                start_time
-            )
-
-            - 1
-
+            bisect.bisect_right(timestamps, start_time) - 1
         )
 
-
         if calibration_number < 0:
-
             pos = 0
-
         else:
-
-            pos = index[
-                calibration_number
-            ][1]
+            pos = index[calibration_number][1]
 
     else:
-
         pos = 0
 
-
     timestamp = None
-
     price = None
 
     bucket = []
-
     results = []
 
-
     def finish_bucket():
-
         if not bucket:
-
             return
 
-
-        values = [
-
-            x["price"]
-
-            for x in bucket
-
-        ]
-
+        values = [item["price"] for item in bucket]
 
         results.append({
-
-            "time":
-                bucket[-1]["time"],
-
-            "price":
-                bucket[-1]["price"],
-
-            "min":
-                min(values),
-
-            "max":
-                max(values),
-
-            "median":
-                statistics.median(values)
-
+            "time": bucket[-1]["time"],
+            "price": bucket[-1]["price"],
+            "min": min(values),
+            "max": max(values),
+            "median": statistics.median(values)
         })
-
 
         bucket.clear()
 
-
     data_length = len(data)
 
-
     while pos < data_length:
-
         record = data[pos]
-
         pos += 1
 
-
-        # ----------------------------------------------------
-        # CALIBRATION
-        # ----------------------------------------------------
-
         if record == ord("C"):
-
             if pos + 16 > data_length:
-
-                raise ValueError(
-                    "Incomplete calibration record"
-                )
-
+                raise ValueError("Incomplete calibration record")
 
             timestamp, price = struct.unpack(
                 "<dQ",
-                data[
-                    pos:pos + 16
-                ]
+                data[pos:pos + 16]
             )
-
 
             pos += 16
 
-
-        # ----------------------------------------------------
-        # DELTA
-        # ----------------------------------------------------
-
         elif record == ord("D"):
+            if timestamp is None or price is None:
+                raise ValueError("Delta before calibration")
 
-            if (
-                timestamp is None
-                or price is None
-            ):
-
-                raise ValueError(
-                    "Delta before calibration"
-                )
-
-
-            delta, pos = read_delta(
-                data,
-                pos
-            )
-
+            delta, pos = read_delta(data, pos)
 
             price += delta
-
             timestamp += SAMPLE_INTERVAL
 
-
-            if (
-                price < 0
-                or price > 0xFFFFFFFFFFFFFFFF
-            ):
-
-                raise ValueError(
-                    f"Invalid decoded price: {price}"
-                )
-
+            if price < 0 or price > 0xFFFFFFFFFFFFFFFF:
+                raise ValueError(f"Invalid decoded price: {price}")
 
         else:
+            raise ValueError(f"Unknown record marker: {record}")
 
-            raise ValueError(
-                f"Unknown record marker: {record}"
-            )
-
-
-        # ----------------------------------------------------
-        # Ignore points before requested range.
-        # ----------------------------------------------------
-
-        if (
-            start_time is not None
-            and timestamp < start_time
-        ):
-
+        if start_time is not None and timestamp < start_time:
             continue
-
 
         point = {
-
-            "time":
-                timestamp,
-
-            "price":
-                decompress_price(price)
-
+            "time": timestamp,
+            "price": decompress_price(price)
         }
 
-
-        # ----------------------------------------------------
-        # Start first bucket.
-        # ----------------------------------------------------
-
         if not bucket:
-
             bucket.append(point)
-
             continue
 
-
-        # ----------------------------------------------------
-        # Start a new bucket.
-        # ----------------------------------------------------
-
-        if (
-            timestamp
-            - bucket[0]["time"]
-            >= granularity
-        ):
-
+        if timestamp - bucket[0]["time"] >= granularity:
             finish_bucket()
-
 
         bucket.append(point)
 
-
     finish_bucket()
 
-
     return results
-
-
-# ============================================================
-# UPLOAD MAIN HISTORY TO B2
-# ============================================================
-
-def upload_history_to_b2():
-
-    with data_lock:
-
-        data = bytes(
-            compressed_data
-        )
-
-
-    if not data:
-
-        print(
-            "B2 upload skipped: "
-            "no history yet."
-        )
-
-        return
-
-
-    started = time.time()
-
-
-    print(
-        f"Starting B2 main-history upload: "
-        f"{len(data) / 1024 / 1024:.2f} MB"
-    )
-
-
-    b2_bucket.upload_bytes(
-        data,
-        B2_HISTORY_FILENAME,
-        content_type="application/octet-stream"
-    )
-
-
-    elapsed = time.time() - started
-
-
-    print(
-        f"B2 main-history upload complete: "
-        f"{len(data) / 1024 / 1024:.2f} MB "
-        f"in {elapsed:.1f}s"
-    )
 
 
 # ============================================================
@@ -1364,11 +1085,7 @@ def upload_history_to_b2():
 # ============================================================
 
 def get_elytra_price():
-
-    print(
-        "DEBUG: requesting Donut API..."
-    )
-
+    print("DEBUG: requesting Donut API...")
 
     response = requests.get(
         API_URL,
@@ -1376,41 +1093,26 @@ def get_elytra_price():
         timeout=10
     )
 
-
-    print(
-        f"DEBUG: Donut API status = "
-        f"{response.status_code}"
-    )
-
+    print(f"DEBUG: Donut API status = {response.status_code}")
 
     response.raise_for_status()
 
-
     data = response.json()
 
-
-    print(
-        f"DEBUG: API returned "
-        f"{len(data)} items"
-    )
-
+    print(f"DEBUG: API returned {len(data)} items")
 
     for item in data:
-
         print(
             f"DEBUG: item={item.get('itemName')} "
             f"price={item.get('unitPrice')} "
             f"stale={item.get('isStale')}"
         )
 
-
         if (
             item.get("itemName") == "elytra"
             and not item.get("isStale")
         ):
-
             return item["unitPrice"]
-
 
     raise ValueError(
         "Elytra was not found in the API response "
@@ -1423,89 +1125,51 @@ def get_elytra_price():
 # ============================================================
 
 def collector():
-
     while True:
-
         started = time.time()
 
-
         try:
-
             price = get_elytra_price()
 
-
-            add_price(
-                time.time(),
-                price
-            )
-
+            add_price(time.time(), price)
 
             with data_lock:
-
-                size = len(
-                    compressed_data
-                )
-
+                size = len(compressed_data)
 
             print(
                 f"Elytra: {price:,} | "
-                f"History: "
-                f"{size / 1024 / 1024:.2f} MB"
+                f"History: {size / 1024 / 1024:.2f} MB"
             )
 
-
         except Exception as e:
-
             print(
                 f"Error collecting price: "
                 f"{type(e).__name__}: {e}"
             )
 
-
-        elapsed = (
-            time.time()
-            - started
-        )
-
+        elapsed = time.time() - started
 
         sleep_time = max(
             0,
             SAMPLE_INTERVAL - elapsed
         )
 
-
-        time.sleep(
-            sleep_time
-        )
+        time.sleep(sleep_time)
 
 
 # ============================================================
-# B2 MAIN HISTORY UPLOADER
+# MAIN HISTORY UPLOADER
 # ============================================================
 
 def b2_uploader():
-
     while True:
-
-        time.sleep(
-            B2_UPLOAD_INTERVAL
-        )
-
+        time.sleep(B2_UPLOAD_INTERVAL)
 
         try:
-
             upload_history_to_b2()
-
-
-            # ------------------------------------------------
-            # Keep only one version of the main file.
-            # ------------------------------------------------
-
             cleanup_old_history_versions()
 
-
         except Exception as e:
-
             print(
                 f"B2 upload failed: "
                 f"{type(e).__name__}: {e}"
@@ -1513,23 +1177,43 @@ def b2_uploader():
 
 
 # ============================================================
-# B2 6-HOUR INCREMENTAL BACKUP WORKER
+# SIX-HOUR INCREMENTAL BACKUP WORKER
 # ============================================================
 
 def b2_backup_worker():
-    # Run once on startup to migrate/catch up any unarchived history,
-    # then continue at six-hour intervals. A delayed run catches up from
-    # the latest archived timestamp; it does not create overlapping data.
+    """
+    Run immediately on startup, then every six hours.
+
+    If a backup fails, retry in 60 seconds. The last successful
+    segment remains the checkpoint, so missing data is retried.
+    """
+    next_backup = time.monotonic()
+
     while True:
+        delay = next_backup - time.monotonic()
+
+        if delay > 0:
+            time.sleep(delay)
+
         try:
             archive_new_history_to_b2()
+
+            # Advance the schedule only after successful completion.
+            next_backup += B2_BACKUP_INTERVAL
+
+            # If we fell behind, catch up immediately.
+            if next_backup <= time.monotonic():
+                next_backup = time.monotonic()
+
         except Exception as e:
             print(
-                f"Incremental backup failed (data retained for retry): "
+                f"Incremental backup failed; retrying in 60 seconds: "
                 f"{type(e).__name__}: {e}"
             )
 
-        time.sleep(B2_BACKUP_INTERVAL)
+            time.sleep(60)
+
+            # Retry without advancing the successful backup schedule.
 
 
 # ============================================================
@@ -1538,19 +1222,16 @@ def b2_backup_worker():
 
 @app.route("/")
 def home():
-
     return render_template_string("""
 <!DOCTYPE html>
 <html>
 
 <head>
-
 <title>Donut Elytra Price</title>
 
 <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
 
 <style>
-
 body{
     background:#111;
     color:white;
@@ -1636,723 +1317,321 @@ canvas{
     border-radius:12px;
     padding:10px
 }
-
 </style>
-
 </head>
-
 
 <body>
 
 <h1>Donut SMP Elytra Price</h1>
 
-
-<div id="price">
-    Loading...
-</div>
-
+<div id="price">Loading...</div>
 
 <div class="controls">
 
-
 <div class="control">
-
 <label>Time Range</label>
-
 <div class="buttons" id="rangeButtons">
-
-<button data-range="minute">
-1 min
-</button>
-
-<button data-range="5minutes">
-5 min
-</button>
-
-<button data-range="hour">
-1 hour
-</button>
-
-<button data-range="day">
-1 day
-</button>
-
-<button data-range="week">
-1 week
-</button>
-
-<button data-range="month">
-1 month
-</button>
-
-<button data-range="max">
-Max
-</button>
-
+<button data-range="minute">1 min</button>
+<button data-range="5minutes">5 min</button>
+<button data-range="hour">1 hour</button>
+<button data-range="day">1 day</button>
+<button data-range="week">1 week</button>
+<button data-range="month">1 month</button>
+<button data-range="max">Max</button>
 </div>
-
 </div>
-
 
 <div class="control">
-
 <label>Granularity</label>
-
 <div class="buttons" id="granularityButtons">
-
-<button data-granularity="1">
-1 sec
-</button>
-
-<button data-granularity="10">
-10 sec
-</button>
-
-<button data-granularity="60">
-1 min
-</button>
-
-<button data-granularity="300">
-5 min
-</button>
-
-<button data-granularity="3600">
-1 hour
-</button>
-
-<button data-granularity="86400">
-1 day
-</button>
-
+<button data-granularity="1">1 sec</button>
+<button data-granularity="10">10 sec</button>
+<button data-granularity="60">1 min</button>
+<button data-granularity="300">5 min</button>
+<button data-granularity="3600">1 hour</button>
+<button data-granularity="86400">1 day</button>
 </div>
-
 </div>
-
 
 <div class="control">
-
 <label>Smoothness</label>
-
 <div class="buttons" id="smoothnessButtons">
-
-<button data-smoothness="0">
-Off
-</button>
-
-<button data-smoothness="1">
-Low
-</button>
-
-<button data-smoothness="2">
-Medium
-</button>
-
-<button data-smoothness="3">
-High
-</button>
-
-<button data-smoothness="4">
-Very High
-</button>
-
+<button data-smoothness="0">Off</button>
+<button data-smoothness="1">Low</button>
+<button data-smoothness="2">Medium</button>
+<button data-smoothness="3">High</button>
+<button data-smoothness="4">Very High</button>
+</div>
 </div>
 
 </div>
-
-</div>
-
 
 <div id="stats">
-
 <div class="stat">
-Time:
-<strong id="hoverTime">
-Move over graph
-</strong>
+Time: <strong id="hoverTime">Move over graph</strong>
 </div>
-
 <div class="stat">
-Price:
-<strong id="hoverPrice">
-—
-</strong>
+Price: <strong id="hoverPrice">—</strong>
 </div>
-
 <div class="stat">
-Min:
-<strong id="statMin">
-—
-</strong>
+Min: <strong id="statMin">—</strong>
 </div>
-
 <div class="stat">
-Max:
-<strong id="statMax">
-—
-</strong>
+Max: <strong id="statMax">—</strong>
 </div>
-
 <div class="stat">
-Median:
-<strong id="statMedian">
-—
-</strong>
+Median: <strong id="statMedian">—</strong>
 </div>
-
 </div>
-
 
 <canvas id="chart"></canvas>
 
-
 <script>
-
-const ctx =
-    document.getElementById("chart");
-
+const ctx = document.getElementById("chart");
 
 const defaultGranularity = {
-
     minute:1,
-
     "5minutes":1,
-
     hour:60,
-
     day:300,
-
     week:3600,
-
     month:86400,
-
     max:86400
-
 };
 
-
 let selectedRange = "hour";
-
-let selectedGranularity =
-    defaultGranularity[selectedRange];
-
+let selectedGranularity = defaultGranularity[selectedRange];
 let selectedSmoothness = 0;
-
 let chartHistory = [];
-
-
 let updateInProgress = false;
-
 let updateAgain = false;
 
-
 function smoothData(data, level){
-
-    if(
-        level === 0
-        || data.length < 3
-    ){
-
-        return data.map(
-            x => x.price
-        );
-
+    if(level === 0 || data.length < 3){
+        return data.map(x => x.price);
     }
-
 
     const radius = level * 3;
 
-
     return data.map((point, i) => {
-
-        const start =
-            Math.max(0, i - radius);
-
-        const end =
-            Math.min(
-                data.length - 1,
-                i + radius
-            );
-
+        const start = Math.max(0, i - radius);
+        const end = Math.min(data.length - 1, i + radius);
 
         let total = 0;
 
-
-        for(
-            let j = start;
-            j <= end;
-            j++
-        ){
-
+        for(let j = start; j <= end; j++){
             total += data[j].price;
-
         }
 
-
-        return total /
-            (end - start + 1);
-
+        return total / (end - start + 1);
     });
-
 }
 
+const chart = new Chart(ctx, {
+    type:"line",
 
-const chart = new Chart(
-    ctx,
-    {
+    data:{
+        labels:[],
+        datasets:[{
+            label:"Elytra Price",
+            data:[],
+            borderColor:"#00ff88",
+            backgroundColor:"rgba(0,255,136,0.1)",
+            borderWidth:2,
+            tension:0.15,
+            pointRadius:0,
+            fill:true
+        }]
+    },
 
-        type:"line",
+    options:{
+        responsive:true,
+        animation:false,
 
-        data:{
-
-            labels:[],
-
-            datasets:[{
-
-                label:"Elytra Price",
-
-                data:[],
-
-                borderColor:"#00ff88",
-
-                backgroundColor:
-                    "rgba(0,255,136,0.1)",
-
-                borderWidth:2,
-
-                tension:0.15,
-
-                pointRadius:0,
-
-                fill:true
-
-            }]
-
+        interaction:{
+            mode:"index",
+            intersect:false
         },
 
+        plugins:{
+            tooltip:{
+                enabled:false
+            }
+        },
 
-        options:{
-
-            responsive:true,
-
-            animation:false,
-
-
-            interaction:{
-
-                mode:"index",
-
-                intersect:false
-
-            },
-
-
-            plugins:{
-
-                tooltip:{
-                    enabled:false
+        scales:{
+            x:{
+                title:{
+                    display:true,
+                    text:"Time"
                 }
-
             },
 
-
-            scales:{
-
-                x:{
-
-                    title:{
-
-                        display:true,
-
-                        text:"Time"
-
-                    }
-
+            y:{
+                title:{
+                    display:true,
+                    text:"Price"
                 },
 
-
-                y:{
-
-                    title:{
-
-                        display:true,
-
-                        text:"Price"
-
-                    },
-
-
-                    ticks:{
-
-                        callback:value =>
-                            Number(value)
-                                .toLocaleString()
-
-                    }
-
+                ticks:{
+                    callback:value => Number(value).toLocaleString()
                 }
-
             }
-
         }
-
     }
-);
-
+});
 
 function updateButtons(){
+    document.querySelectorAll("#rangeButtons button").forEach(button => {
+        button.classList.toggle(
+            "active",
+            button.dataset.range === selectedRange
+        );
+    });
 
-    document
-        .querySelectorAll(
-            "#rangeButtons button"
-        )
-        .forEach(button => {
+    document.querySelectorAll("#granularityButtons button").forEach(button => {
+        button.classList.toggle(
+            "active",
+            Number(button.dataset.granularity) === selectedGranularity
+        );
+    });
 
-            button.classList.toggle(
-                "active",
-
-                button.dataset.range
-                === selectedRange
-            );
-
-        });
-
-
-    document
-        .querySelectorAll(
-            "#granularityButtons button"
-        )
-        .forEach(button => {
-
-            button.classList.toggle(
-                "active",
-
-                Number(
-                    button.dataset.granularity
-                )
-                === selectedGranularity
-            );
-
-        });
-
-
-    document
-        .querySelectorAll(
-            "#smoothnessButtons button"
-        )
-        .forEach(button => {
-
-            button.classList.toggle(
-                "active",
-
-                Number(
-                    button.dataset.smoothness
-                )
-                === selectedSmoothness
-            );
-
-        });
-
+    document.querySelectorAll("#smoothnessButtons button").forEach(button => {
+        button.classList.toggle(
+            "active",
+            Number(button.dataset.smoothness) === selectedSmoothness
+        );
+    });
 }
-
 
 function showStats(point){
+    if(!point) return;
 
-    if(!point)
-        return;
+    document.getElementById("hoverTime").textContent =
+        new Date(point.time * 1000).toLocaleString();
 
+    document.getElementById("hoverPrice").textContent =
+        Math.round(point.price).toLocaleString() + " coins";
 
-    document
-        .getElementById("hoverTime")
-        .textContent =
-        new Date(
-            point.time * 1000
-        ).toLocaleString();
+    document.getElementById("statMin").textContent =
+        Math.round(point.min).toLocaleString();
 
+    document.getElementById("statMax").textContent =
+        Math.round(point.max).toLocaleString();
 
-    document
-        .getElementById("hoverPrice")
-        .textContent =
-        Math.round(
-            point.price
-        ).toLocaleString()
-        + " coins";
-
-
-    document
-        .getElementById("statMin")
-        .textContent =
-        Math.round(
-            point.min
-        ).toLocaleString();
-
-
-    document
-        .getElementById("statMax")
-        .textContent =
-        Math.round(
-            point.max
-        ).toLocaleString();
-
-
-    document
-        .getElementById("statMedian")
-        .textContent =
-        Math.round(
-            point.median
-        ).toLocaleString();
-
+    document.getElementById("statMedian").textContent =
+        Math.round(point.median).toLocaleString();
 }
 
+ctx.addEventListener("mousemove", event => {
+    const elements = chart.getElementsAtEventForMode(
+        event,
+        "index",
+        {intersect:false},
+        false
+    );
 
-ctx.addEventListener(
-    "mousemove",
-    event => {
-
-        const elements =
-            chart.getElementsAtEventForMode(
-                event,
-                "index",
-                {
-                    intersect:false
-                },
-                false
-            );
-
-
-        if(elements.length){
-
-            showStats(
-                chartHistory[
-                    elements[0].index
-                ]
-            );
-
-        }
-
+    if(elements.length){
+        showStats(chartHistory[elements[0].index]);
     }
-);
-
+});
 
 async function update(){
-
     if(updateInProgress){
-
         updateAgain = true;
-
         return;
-
     }
-
 
     updateInProgress = true;
 
-
     try{
-
-        const response =
-            await fetch(
-                "/history?range="
-                + encodeURIComponent(
-                    selectedRange
-                )
-                + "&granularity="
-                + encodeURIComponent(
-                    selectedGranularity
-                ),
-                {
-                    cache:"no-store"
-                }
-            );
-
+        const response = await fetch(
+            "/history?range="
+            + encodeURIComponent(selectedRange)
+            + "&granularity="
+            + encodeURIComponent(selectedGranularity),
+            {cache:"no-store"}
+        );
 
         if(!response.ok){
-
-            throw new Error(
-                "HTTP " + response.status
-            );
-
+            throw new Error("HTTP " + response.status);
         }
 
+        chartHistory = await response.json();
 
-        chartHistory =
-            await response.json();
+        chart.data.labels = chartHistory.map(
+            x => new Date(x.time * 1000).toLocaleString()
+        );
 
-
-        chart.data.labels =
-            chartHistory.map(
-                x =>
-                    new Date(
-                        x.time * 1000
-                    ).toLocaleString()
-            );
-
-
-        chart.data.datasets[0].data =
-            smoothData(
-                chartHistory,
-                selectedSmoothness
-            );
-
+        chart.data.datasets[0].data = smoothData(
+            chartHistory,
+            selectedSmoothness
+        );
 
         chart.update();
 
-
         if(chartHistory.length){
+            const latest = chartHistory[chartHistory.length - 1].price;
 
-            const latest =
-                chartHistory[
-                    chartHistory.length - 1
-                ].price;
-
-
-            document
-                .getElementById("price")
-                .textContent =
-                Math.round(
-                    latest
-                ).toLocaleString()
-                + " coins";
-
-        } else {
-
-            document
-                .getElementById("price")
-                .textContent =
-                "No fresh data";
-
+            document.getElementById("price").textContent =
+                Math.round(latest).toLocaleString() + " coins";
+        }else{
+            document.getElementById("price").textContent = "No fresh data";
         }
 
-    }
-    catch(error){
+    }catch(error){
+        console.error("History update failed:", error);
 
-        console.error(
-            "History update failed:",
-            error
-        );
-
-    }
-    finally{
-
+    }finally{
         updateInProgress = false;
 
-
         if(updateAgain){
-
             updateAgain = false;
-
             update();
-
         }
-
     }
-
 }
 
+document.querySelectorAll("#rangeButtons button").forEach(button => {
+    button.addEventListener("click", () => {
+        selectedRange = button.dataset.range;
+        selectedGranularity = defaultGranularity[selectedRange];
 
-document
-    .querySelectorAll(
-        "#rangeButtons button"
-    )
-    .forEach(button => {
+        updateButtons();
+        update();
+    });
+});
 
-        button.addEventListener(
-            "click",
-            () => {
+document.querySelectorAll("#granularityButtons button").forEach(button => {
+    button.addEventListener("click", () => {
+        selectedGranularity = Number(button.dataset.granularity);
 
-                selectedRange =
-                    button.dataset.range;
+        updateButtons();
+        update();
+    });
+});
 
+document.querySelectorAll("#smoothnessButtons button").forEach(button => {
+    button.addEventListener("click", () => {
+        selectedSmoothness = Number(button.dataset.smoothness);
 
-                selectedGranularity =
-                    defaultGranularity[
-                        selectedRange
-                    ];
-
-
-                updateButtons();
-
-                update();
-
-            }
+        chart.data.datasets[0].data = smoothData(
+            chartHistory,
+            selectedSmoothness
         );
 
+        chart.update();
+        updateButtons();
     });
-
-
-document
-    .querySelectorAll(
-        "#granularityButtons button"
-    )
-    .forEach(button => {
-
-        button.addEventListener(
-            "click",
-            () => {
-
-                selectedGranularity =
-                    Number(
-                        button.dataset.granularity
-                    );
-
-
-                updateButtons();
-
-                update();
-
-            }
-        );
-
-    });
-
-
-document
-    .querySelectorAll(
-        "#smoothnessButtons button"
-    )
-    .forEach(button => {
-
-        button.addEventListener(
-            "click",
-            () => {
-
-                selectedSmoothness =
-                    Number(
-                        button.dataset.smoothness
-                    );
-
-
-                chart.data.datasets[0].data =
-                    smoothData(
-                        chartHistory,
-                        selectedSmoothness
-                    );
-
-
-                chart.update();
-
-                updateButtons();
-
-            }
-
-        );
-
-    });
-
+});
 
 updateButtons();
-
 update();
 
-
-setInterval(
-    update,
-    5000
-);
-
+setInterval(update, 5000);
 </script>
 
 </body>
-
 </html>
 """)
 
@@ -2363,81 +1642,36 @@ setInterval(
 
 @app.route("/history")
 def history_endpoint():
+    selected_range = request.args.get("range", "hour")
 
-    selected_range = request.args.get(
-        "range",
-        "hour"
-    )
-
-
-    if (
-        selected_range
-        not in DEFAULT_GRANULARITY
-    ):
-
+    if selected_range not in DEFAULT_GRANULARITY:
         selected_range = "hour"
 
+    granularity = request.args.get("granularity", type=int)
 
-    granularity = request.args.get(
-        "granularity",
-        type=int
-    )
-
-
-    if (
-        granularity
-        not in VALID_GRANULARITIES
-    ):
-
-        granularity = (
-            DEFAULT_GRANULARITY[
-                selected_range
-            ]
-        )
-
+    if granularity not in VALID_GRANULARITIES:
+        granularity = DEFAULT_GRANULARITY[selected_range]
 
     if selected_range == "max":
-
         start_time = None
-
     else:
-
-        start_time = (
-
-            time.time()
-
-            -
-
-            TIME_RANGES[
-                selected_range
-            ]
-
-        )
-
+        start_time = time.time() - TIME_RANGES[selected_range]
 
     started = time.time()
-
 
     result = decode_history(
         start_time,
         granularity
     )
 
-
-    elapsed = (
-        time.time()
-        - started
-    )
-
+    elapsed = time.time() - started
 
     print(
-        f"/history "
-        f"range={selected_range} "
+        f"/history range={selected_range} "
         f"granularity={granularity} "
         f"points={len(result):,} "
         f"time={elapsed:.3f}s"
     )
-
 
     return jsonify(result)
 
@@ -2448,43 +1682,28 @@ def history_endpoint():
 
 @app.route("/stats")
 def stats():
-
     with data_lock:
-
         return jsonify({
+            "compressed_bytes": len(compressed_data),
 
-            "compressed_bytes":
-                len(compressed_data),
+            "compressed_mb": round(
+                len(compressed_data) / 1024 / 1024,
+                3
+            ),
 
-            "compressed_mb":
-                round(
-                    len(compressed_data)
-                    / 1024
-                    / 1024,
-                    3
-                ),
+            "calibrations": len(calibration_index),
 
-            "calibrations":
-                len(calibration_index),
+            "price_scale": PRICE_DIVISOR,
 
-            "price_scale":
-                PRICE_DIVISOR,
+            "calibration_seconds": CALIBRATION_INTERVAL,
 
-            "calibration_seconds":
-                CALIBRATION_INTERVAL,
+            "current_price": (
+                None
+                if current_price is None
+                else decompress_price(current_price)
+            ),
 
-            "current_price":
-                (
-                    None
-                    if current_price is None
-                    else decompress_price(
-                        current_price
-                    )
-                ),
-
-            "current_timestamp":
-                current_timestamp
-
+            "current_timestamp": current_timestamp
         })
 
 
@@ -2493,53 +1712,15 @@ def stats():
 # ============================================================
 
 if __name__ == "__main__":
-
-    print(
-        "================================================"
-    )
-
-    print(
-        "Starting Donut Elytra price tracker..."
-    )
-
-    print(
-        "================================================"
-    )
-
-
-    # --------------------------------------------------------
-    # Load main history.
-    #
-    # If it is broken/missing, automatically use the newest
-    # recovery snapshot.
-    # --------------------------------------------------------
+    print("================================================")
+    print("Starting Donut Elytra price tracker...")
+    print("================================================")
 
     load_history_with_recovery()
 
-
-    print(
-        "History initialization complete."
-    )
-
-
-    # --------------------------------------------------------
-    # IMPORTANT:
-    #
-    # Clean the old 372+ versions created by the previous
-    # system.
-    #
-    # This keeps ONLY the newest version of the main file.
-    # --------------------------------------------------------
+    print("History initialization complete.")
 
     cleanup_old_history_versions()
-
-
-    # Incremental backup segments are retained indefinitely.
-    # No automatic backup deletion is performed.
-
-    # --------------------------------------------------------
-    # Start price collector.
-    # --------------------------------------------------------
 
     threading.Thread(
         target=collector,
@@ -2547,21 +1728,11 @@ if __name__ == "__main__":
         name="price-collector"
     ).start()
 
-
-    # --------------------------------------------------------
-    # Start main B2 uploader.
-    # --------------------------------------------------------
-
     threading.Thread(
         target=b2_uploader,
         daemon=True,
         name="b2-uploader"
     ).start()
-
-
-    # --------------------------------------------------------
-    # Start 6-hour incremental backup worker.
-    # --------------------------------------------------------
 
     threading.Thread(
         target=b2_backup_worker,
@@ -2569,27 +1740,13 @@ if __name__ == "__main__":
         name="b2-backup-worker"
     ).start()
 
-
-    print(
-        "Collector started."
-    )
-
-    print(
-        "B2 uploader started."
-    )
-
-    print(
-        "6-hour incremental backup worker started."
-    )
-
-    print(
-        "Web server starting..."
-    )
-
+    print("Collector started.")
+    print("B2 uploader started.")
+    print("6-hour incremental backup worker started.")
+    print("Web server starting...")
 
     app.run(
-    host="0.0.0.0",
-    port=int(os.environ.get("PORT", 10000)),
-    threaded=True
-)
-
+        host="0.0.0.0",
+        port=int(os.environ.get("PORT", 10000)),
+        threaded=True
+    )
